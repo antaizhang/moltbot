@@ -152,10 +152,18 @@ runEmbeddedPiAgent() {
 5. 硬编码默认（anthropic/claude-opus-4-5）
 
 模型别名支持：
-  "opus"  → "anthropic/claude-opus-4-5"
-  "sonnet" → "anthropic/claude-sonnet-4-20250514"
-  "gpt4"  → "openai/gpt-4o"
-  "gemini" → "google/gemini-2.0-flash"
+  "opus"        → "anthropic/claude-opus-4-5-20251101"
+  "sonnet"      → "anthropic/claude-sonnet-4-20250514"
+  "gpt4"        → "openai/gpt-4o"
+  "gemini"      → "google/gemini-2.0-flash"
+  "deepseek"    → "deepseek/deepseek-chat"
+  "gemini-flash"→ "google/gemini-2.0-flash"
+  "qwen"        → "ollama/qwen2.5:32b"
+
+Ollama 自动发现：
+  Moltbot 会自动检测本地运行的 Ollama 实例，
+  发现已拉取的模型后自动注册为可用模型别名，
+  无需手动配置即可使用本地模型。
 ```
 
 ### 2.3 模型降级（Fallback）
@@ -272,6 +280,21 @@ anthropic:
 ├─────────────────────────────────────────┤
 │ 13. 项目上下文                            │
 │     注入的 SOUL.md 等自定义指令文件         │
+├─────────────────────────────────────────┤
+│ 14. Canvas 指令                          │
+│     交互式 Canvas 使用方式与限制            │
+├─────────────────────────────────────────┤
+│ 15. 沙箱环境                              │
+│     Docker/SSH 沙箱执行能力与安全边界       │
+├─────────────────────────────────────────┤
+│ 16. 子Agent 指令                         │
+│     子Agent 派生、控制与通信协议            │
+├─────────────────────────────────────────┤
+│ 17. 图片生成指令                          │
+│     image_generate 工具使用与提供商配置     │
+├─────────────────────────────────────────┤
+│ 18. TTS 指令                             │
+│     文字转语音能力与可用语音列表             │
 └─────────────────────────────────────────┘
 ```
 
@@ -287,13 +310,17 @@ Agent 可以使用的工具需要经过多层过滤：
     ▼
 ┌──────────────────┐
 │  基础工具          │  read, write, edit, grep, find, ls, exec
-│  (来自 pi-coding)  │
+│  (来自 pi-coding)  │  （文件与 Shell 操作基础集）
 └────────┬─────────┘
          │
          ▼
 ┌──────────────────┐
 │  Moltbot 工具     │  message, web_search, web_fetch, browser,
-│  (自定义)         │  sessions_send, image, gateway_restart, ...
+│  (自定义)         │  image, image_generate, canvas, cron, tts,
+│                   │  pdf, nodes, memory_search, memory_get,
+│                   │  sessions_send, sessions_spawn, subagents,
+│                   │  sessions_list, sessions_history, gateway,
+│                   │  agents_list
 └────────┬─────────┘
          │
          ▼
@@ -303,10 +330,10 @@ Agent 可以使用的工具需要经过多层过滤：
          │
     策略过滤层
          │
-    ┌────┼────┬────┬────┬────┬────┐
-    ▼    ▼    ▼    ▼    ▼    ▼    ▼
-  Auth  Provider Global Agent Group Sandbox Subagent
-  策略   策略    策略   策略   策略   策略    策略
+    ┌────┼────┬────┬────┬────┬────┬────┐
+    ▼    ▼    ▼    ▼    ▼    ▼    ▼    ▼
+  Auth  Provider Global Agent Group Sandbox Subagent Canvas
+  策略   策略    策略   策略   策略   策略    策略    策略
 
 最终可用工具 = 通过所有策略过滤后的工具集合
 ```
@@ -340,10 +367,12 @@ Agent 可以使用的工具需要经过多层过滤：
 
 这是实际调用 AI API 的步骤。以 Anthropic Claude 为例：
 
+> Moltbot 支持 10+ AI 提供商：Anthropic (Claude)、OpenAI (GPT)、Google (Gemini)、Mistral、Groq、xAI (Grok)、DeepSeek、Ollama（本地）、vLLM（本地 GPU）等。
+
 ```json
 // 发送给 Anthropic API 的请求（简化版）
 {
-  "model": "claude-opus-4-5-20251101",
+  "model": "claude-sonnet-4-20250514",
   "max_tokens": 8192,
   "system": "你是一个运行在 Moltbot 中的个人助手...",
   "messages": [
@@ -652,19 +681,45 @@ Agent 1 (default)          Agent 2 (writer)          Agent 3 (coder)
 Agent 之间可以通过 sessions_send 工具互发消息
 ```
 
+### 子Agent 编排
+
+Moltbot 支持主Agent动态派生子Agent，实现并行任务处理：
+
+```
+sessions_spawn 工具:
+  主Agent调用 → 创建子Agent → 子Agent独立运行
+  子Agent有独立的 session、模型、工具集
+
+subagents 工具:
+  list  → 查看所有活跃子Agent
+  kill  → 终止子Agent
+  steer → 给子Agent发送新指令
+
+子Agent通信:
+  announce     → 子Agent上报结果给父Agent
+  sessions_send → Agent之间点对点消息
+
+典型场景:
+  "分析5个板块" → 主Agent spawn 5个子Agent
+  → 子Agent并行分析 → 结果汇总 → 推送通知
+```
+
 ---
 
 ## 与主流方案的对比
 
 | 特性 | Moltbot | 普通 ChatBot | LangChain |
 |------|---------|-------------|-----------|
-| 多渠道 | 15+ 平台统一接入 | 通常单平台 | 无内置 |
+| 多渠道 | 30+ 平台统一接入 | 通常单平台 | 无内置 |
 | 多模型 | 自动降级 + 轮转 | 单模型 | 需手写 |
-| 工具调用 | 内置 20+ 工具 + 插件扩展 | 简单 | 框架支持 |
+| 工具调用 | 内置 22+ 工具 + 插件扩展 | 简单 | 框架支持 |
 | 流式响应 | 原生支持 + 分块投递 | 取决于实现 | 支持 |
 | 对话持久化 | 文件系统 JSONL | 内存 | 需手写 |
 | 上下文压缩 | 自动摘要 | 无 | 需手写 |
 | 认证轮转 | 多 Key 冷却机制 | 单 Key | 无 |
+| 子Agent编排 | 动态 spawn + 并行 + 汇总 | 无 | 需手写 |
+| 沙箱执行 | Docker/SSH 沙箱 | 无 | 需手写 |
+| OpenAI 兼容 API | /v1/chat/completions | N/A | N/A |
 
 ---
 

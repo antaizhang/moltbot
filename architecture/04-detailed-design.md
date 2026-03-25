@@ -16,6 +16,12 @@
 8. [记忆系统设计](#8-记忆系统设计)
 9. [出站投递设计](#9-出站投递设计)
 10. [定时任务与钩子](#10-定时任务与钩子)
+11. [子Agent编排设计](#11-子agent编排设计)
+12. [沙箱执行设计](#12-沙箱执行设计)
+13. [Canvas交互设计](#13-canvas交互设计)
+14. [OpenAI兼容API设计](#14-openai兼容api设计)
+15. [语音与TTS设计](#15-语音与tts设计)
+16. [技能系统设计](#16-技能系统设计)
 
 ---
 
@@ -29,10 +35,13 @@
 网关服务器
 ├── HTTP 服务器        → 提供 Web UI、API 端点、健康检查
 ├── WebSocket 服务器   → 与 CLI 客户端、移动端实时通信
-├── 渠道管理器         → 管理 15+ 个聊天平台的连接生命周期
+├── 渠道管理器         → 管理 30+ 个聊天平台的连接生命周期
 ├── 插件管理器         → 加载和管理扩展插件
 ├── 配置监听器         → 配置文件变更时自动重载
 ├── 定时任务调度器      → cron 任务执行
+├── OpenAI 兼容 API    → /v1/chat/completions, /v1/embeddings, /v1/models
+├── 嵌入 API 服务      → HTTP 嵌入向量端点
+├── 控制面板 UI        → 内置 Web 管理界面
 └── Agent 执行上下文    → 为 AI 调用提供运行环境
 ```
 
@@ -94,6 +103,10 @@ moltbot gateway run --bind loopback --port 18789
   config.set        # 修改配置
   sessions.list     # 列出会话
   sessions.model    # 切换会话模型
+  sessions.spawn    # 派生子Agent
+  sessions.send     # 发送到会话
+  tts.generate      # 生成语音
+  canvas.state      # Canvas 状态
 
 网关 → 客户端:
   chat.partial      # 流式回复片段
@@ -101,6 +114,9 @@ moltbot gateway run --bind loopback --port 18789
   chat.tool         # 工具调用通知
   chat.error        # 错误通知
   channels.event    # 渠道状态变更
+  chat.subagent     # 子Agent 事件
+  tts.audio         # 音频数据
+  canvas.update     # Canvas 状态更新
 ```
 
 ---
@@ -899,6 +915,246 @@ function chunkText(text: string, limit: number): string[] {
     ],
   },
 }
+```
+
+---
+
+## 11. 子Agent编排设计
+
+### 11.1 架构角色
+
+子Agent系统允许主Agent动态派生多个子Agent并行执行任务。
+
+```
+主Agent (parent)
+├── sessions_spawn(prompt, model?, tools?) → 创建子Agent
+├── subagents(action: "list") → 查看活跃子Agent
+├── subagents(action: "kill", id) → 终止子Agent
+└── subagents(action: "steer", id, prompt) → 发送新指令
+
+子Agent (child)
+├── 独立的 session 和对话历史
+├── 可以有独立的模型和工具集
+├── announce → 上报结果给父Agent
+└── sessions_send → 与其他Agent通信
+```
+
+### 11.2 关键文件
+
+```
+src/agents/
+├── subagent-registry.ts         # 子Agent注册表
+├── subagent-spawn.ts            # 子Agent创建逻辑
+├── subagent-control.ts          # 子Agent控制（kill/steer）
+├── subagent-announce.ts         # 结果上报机制
+├── subagent-depth.ts            # 嵌套深度管理
+├── subagent-lifecycle-events.ts # 生命周期事件
+├── subagent-orphan-recovery.ts  # 孤儿Agent回收
+└── subagent-registry-cleanup.ts # 注册表清理
+```
+
+### 11.3 并行执行模式
+
+```
+用户: "分析5个板块的最新新闻"
+
+主Agent 规划:
+  → spawn 5个子Agent，每个负责一个板块
+  → Promise.all 并行等待
+  → 收集所有结果
+  → 汇总生成综合报告
+  → 推送到 Telegram
+
+子Agent-半导体:  web_search → memory_search → 分析 → announce
+子Agent-新能源:  web_search → memory_search → 分析 → announce
+子Agent-AI:     web_search → memory_search → 分析 → announce
+子Agent-消费:   web_search → memory_search → 分析 → announce
+子Agent-医药:   web_search → memory_search → 分析 → announce
+```
+
+---
+
+## 12. 沙箱执行设计
+
+### 12.1 架构角色
+
+为Agent提供隔离的代码执行环境，防止危险操作影响主机。
+
+### 12.2 后端实现
+
+```
+src/agents/sandbox/
+├── backend.ts         # 沙箱后端抽象
+├── docker-backend.ts  # Docker 容器后端
+├── ssh-backend.ts     # 远程 SSH 后端
+├── docker.ts          # Docker API 封装
+├── ssh.ts             # SSH 客户端封装
+├── fs-bridge.ts       # 文件系统桥接
+├── workspace.ts       # 工作区挂载
+├── config.ts          # 沙箱配置
+├── manage.ts          # 生命周期管理
+└── prune.ts           # 容器清理
+
+src/node-host/
+├── runner.ts          # Node.js 执行器
+├── invoke.ts          # 命令调用
+├── exec-policy.ts     # 执行安全策略
+└── invoke-system-run-allowlist.ts  # 命令白名单
+```
+
+### 12.3 执行流程
+
+```
+Agent 调用 nodes 工具
+    │
+    ▼
+选择沙箱后端
+├── Docker: 创建隔离容器
+├── SSH: 连接远程服务器
+└── Local: 本地沙箱执行
+    │
+    ▼
+挂载工作区文件
+    │
+    ▼
+执行代码/命令
+    │
+    ▼
+收集输出结果
+    │
+    ▼
+清理沙箱环境
+```
+
+---
+
+## 13. Canvas交互设计
+
+### 13.1 架构角色
+
+Canvas 提供交互式可视化渲染能力，基于 A2UI 框架。
+
+### 13.2 关键文件
+
+```
+src/canvas-host/
+├── a2ui.ts        # A2UI 资产服务器
+├── server.ts      # Canvas HTTP 服务器
+├── file-resolver.ts  # 文件解析
+└── a2ui/          # A2UI 框架 bundle
+```
+
+### 13.3 访问路径
+
+```
+/__openclaw__/a2ui    → A2UI 框架资源
+/__openclaw__/canvas  → Canvas 渲染页面
+/__openclaw__/ws      → WebSocket 实时通信
+```
+
+---
+
+## 14. OpenAI兼容API设计
+
+### 14.1 架构角色
+
+网关提供 OpenAI 格式的 HTTP API，任何 OpenAI SDK 客户端可直接接入。
+
+### 14.2 关键文件
+
+**文件**: `src/gateway/openai-http.ts`
+
+### 14.3 支持的端点
+
+```
+POST /v1/chat/completions  → 对话补全（流式+非流式）
+POST /v1/embeddings        → 文本向量化
+GET  /v1/models            → 列出可用模型
+```
+
+### 14.4 配置项
+
+```
+maxBodyBytes: 20MB         # 请求体大小限制
+maxImageParts: 8           # 图片数量限制
+maxTotalImageBytes: 20MB   # 图片总大小限制
+images.allowUrl: false     # URL图片支持
+images.urlAllowlist: []    # 允许的图片域名
+images.allowedMimes: []    # MIME类型限制
+```
+
+### 14.5 兼容性
+
+```
+Python:  from openai import OpenAI; client = OpenAI(base_url="http://localhost:18789/v1")
+Node.js: new OpenAI({ baseURL: "http://localhost:18789/v1" })
+Go:      openai.NewClient(option.WithBaseURL("http://localhost:18789/v1"))
+```
+
+---
+
+## 15. 语音与TTS设计
+
+### 15.1 TTS (语音合成)
+
+```
+src/tts/
+├── core.ts           # TTS 核心实现
+├── provider-registry.ts  # 提供商注册
+├── text-prep.ts      # 文本预处理
+├── auto-mode.ts      # 自动模式选择
+└── runtime.ts        # 运行时管理
+
+支持的提供商:
+├── ElevenLabs (extensions/elevenlabs/)
+├── OpenAI TTS
+├── Sherpa-ONNX (本地离线)
+├── Microsoft Speech (extensions/microsoft/)
+└── Deepgram (extensions/deepgram/)
+```
+
+### 15.2 语音通话
+
+```
+extensions/voice-call/
+├── providers/twilio/   # Twilio 电话
+├── providers/telnyx.ts # Telnyx 电话
+├── providers/plivo.ts  # Plivo 电话
+└── webhook/            # Webhook 处理
+```
+
+---
+
+## 16. 技能系统设计
+
+### 16.1 架构角色
+
+技能（Skills）是领域特定的指令包，动态注入到Agent系统提示词中。
+
+### 16.2 技能目录
+
+```
+skills/
+├── canvas/         # Canvas 交互技能
+├── discord/        # Discord 特定技能
+├── slack/          # Slack 特定技能
+├── github/         # GitHub 集成
+├── notion/         # Notion 集成
+├── voice-call/     # 语音通话技能
+├── coding-agent/   # 编程助手
+├── skill-creator/  # 技能创建器
+└── ...50+ 技能包
+```
+
+### 16.3 技能加载
+
+```
+src/agents/skills/
+├── config.ts       # 技能配置
+├── filters.ts      # 技能过滤器
+├── frontmatter.ts  # 技能元数据解析
+├── plugins.ts      # 插件技能集成
+└── serialization.ts # 技能序列化
 ```
 
 ---
