@@ -147,6 +147,11 @@ vllm serve Qwen/Qwen2.5-72B-Instruct \
 vllm serve deepseek-ai/DeepSeek-R1-Distill-Qwen-32B \
   --host 0.0.0.0 --port 8000 \
   --max-model-len 32768
+
+# DeepSeek V3 (单卡 24GB 可跑 distill 版)
+vllm serve deepseek-ai/DeepSeek-V3-0324 \
+  --host 0.0.0.0 --port 8000 \
+  --tensor-parallel-size 2
 ```
 
 ### 配置 Moltbot
@@ -259,6 +264,7 @@ vllm serve deepseek-ai/DeepSeek-R1-Distill-Qwen-32B \
 | 新闻理解+分类 | 中文理解好、速度快 | Qwen2.5-14B（够用） |
 | 板块影响分析 | 推理能力强 | Qwen2.5-32B 或 DeepSeek-R1-32B |
 | 研报解读 | 长文本、专业术语 | Qwen2.5-72B（长上下文） |
+| 综合分析+推理 | 推理+分析 | DeepSeek-R1-32B 或 Qwen2.5-72B |
 | 实时盘中快扫 | 速度优先 | Qwen2.5-7B（<1秒响应） |
 | 向量搜索/板块匹配 | 嵌入质量 | embeddinggemma-300M（本地默认） |
 

@@ -19,10 +19,12 @@
 | 知识积累 | 历史分析、决策记录可检索 |
 | 多渠道通知 | 买卖信号推送到 Telegram/微信/Slack |
 | AI 分析 | 大模型理解新闻含义、判断影响方向 |
+| 并行分析 | 多板块同时分析，子Agent编排 |
+| 标准 API 接入 | 通过 OpenAI 兼容 API 集成现有系统 |
 
 ---
 
-## Moltbot 可直接复用的 10 个功能
+## Moltbot 可直接复用的 12 个功能
 
 ### 1. 定时任务系统 (Cron) — 定时抓新闻
 
@@ -445,6 +447,79 @@ formatLinkUnderstandingBody() ← 格式化输出
 
 ---
 
+### 11. 子Agent并行分析 — 多板块同时处理
+
+**做什么**: 主Agent派生多个子Agent，并行分析不同板块，大幅提升效率。
+
+**源码位置**: `src/agents/subagent-*.ts`
+
+```
+传统串行:
+  分析半导体 → 分析新能源 → 分析AI → 分析消费 → 分析医药
+  总耗时 = 5 × 单板块时间
+
+子Agent并行:
+  主Agent → spawn 5个子Agent → 并行执行 → 汇总
+  总耗时 ≈ 单板块时间（最慢的那个）
+```
+
+**使用方式**:
+
+```
+用户: "分析今天所有板块的新闻"
+
+Agent 自动:
+1. sessions_spawn("分析半导体板块最新新闻")
+2. sessions_spawn("分析新能源板块最新新闻")
+3. sessions_spawn("分析AI板块最新新闻")
+4. sessions_spawn("分析消费板块最新新闻")
+5. sessions_spawn("分析医药板块最新新闻")
+
+→ 5个子Agent并行工作
+→ 各自 web_search + memory_search + AI分析
+→ announce 上报结果
+→ 主Agent汇总排序
+→ 生成综合报告推送
+```
+
+**POC 参考**: `poc/11-subagent-parallel.ts`
+
+---
+
+### 12. OpenAI兼容API — 集成现有系统
+
+**做什么**: 通过标准 OpenAI API 格式接入 Moltbot，现有系统零改造。
+
+**源码位置**: `src/gateway/openai-http.ts`
+
+```
+任何 OpenAI SDK 客户端可直接接入:
+
+Python:
+  client = OpenAI(base_url="http://localhost:18789/v1")
+  resp = client.chat.completions.create(
+      model="moltbot-analyst-v3",
+      messages=[{"role": "user", "content": "分析半导体板块"}],
+  )
+
+Node.js:
+  const client = new OpenAI({ baseURL: "http://localhost:18789/v1" });
+
+支持:
+  POST /v1/chat/completions (流式+非流式)
+  POST /v1/embeddings (向量化)
+  GET /v1/models (模型列表)
+```
+
+**你的用法**:
+- 现有 Python/Node.js 分析脚本直接接入
+- 只需修改 base_url 即可迁移
+- 前端 UI 可通过标准 API 展示分析结果
+
+**POC 参考**: `poc/12-openai-compat-api.ts`
+
+---
+
 ## 完整的事件驱动流程（组合使用）
 
 把上面的功能串起来，就是你要的**事件驱动投资**系统：
@@ -512,6 +587,8 @@ formatLinkUnderstandingBody() ← 格式化输出
 | 自定义股票工具 | Plugin 插件系统 | `src/plugins/` | 需开发 |
 | 链接自动解析 | Link Understanding | `src/link-understanding/` | 直接用 |
 | 图表分析 | Image 视觉理解 | `src/agents/tools/image-tool.ts` | 直接用 |
+| 并行分析多板块 | 子Agent并行编排 | `src/agents/subagent-*.ts` | 直接用 |
+| 标准API接入 | OpenAI兼容API | `src/gateway/openai-http.ts` | 直接用 |
 
 ---
 
