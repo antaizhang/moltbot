@@ -35,6 +35,12 @@ for f in poc/[0-9]*.ts; do echo "=== $f ===" && bun "$f" && echo; done
 | 10  | `10-link-understanding.ts`        | 链接理解        | URL→抓取→提取实体/情感/板块→汇总                       |
 | 13  | `13-sensitive-data-guardrails.ts` | 敏感数据防护    | 检测手机号/邮箱/证件/API Key，重写后再进工具/会话/日志 |
 
+## 安装版 OpenClaw 复现
+
+- 目录：`poc/13-runtime-repro/`
+- 入口：`poc/13-runtime-repro/README.md`
+- 用途：把 POC 13 的脱敏能力接到本机已安装的 OpenClaw（Hook + Skill）
+
 ## 数据文件
 
 | 文件                     | 内容                                                           |
