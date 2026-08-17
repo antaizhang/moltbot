@@ -1,19 +1,18 @@
-import { resolveDefaultAgentId } from "../agents/agent-scope.js";
+// Implements agent route binding list/add/remove subcommands.
+import { normalizeStringEntries } from "@openclaw/normalization-core/string-normalization";
+import { listAgentEntries, resolveDefaultAgentId } from "../agents/agent-scope.js";
+import { formatCliCommand } from "../cli/command-format.js";
 import { isRouteBinding, listRouteBindings } from "../config/bindings.js";
 import { replaceConfigFile } from "../config/config.js";
 import { logConfigUpdated } from "../config/logging.js";
 import type { AgentRouteBinding } from "../config/types.js";
-import { normalizeAgentId } from "../routing/session-key.js";
-import { type RuntimeEnv, writeRuntimeJson } from "../runtime.js";
-import { defaultRuntime } from "../runtime.js";
-import {
-  applyAgentBindings,
-  describeBinding,
-  parseBindingSpecs,
-  removeAgentBindings,
-} from "./agents.bindings.js";
-import { requireValidConfig, requireValidConfigFileSnapshot } from "./agents.command-shared.js";
-import { buildAgentSummaries } from "./agents.config.js";
+import { normalizeAgentId, normalizeAgentIdStrict } from "../routing/session-key.js";
+import { defaultRuntime, type RuntimeEnv, writeRuntimeJson } from "../runtime.js";
+import { createLazyImportLoader } from "../shared/lazy-promise.js";
+import { describeBinding } from "./agents.binding-format.js";
+import { requireValidConfig, requireValidConfigFileSnapshot } from "./config-validation.js";
+
+type AgentBindingsModule = typeof import("./agents.bindings.js");
 
 type AgentsBindingsListOptions = {
   agent?: string;
@@ -33,28 +32,24 @@ type AgentsUnbindOptions = {
   json?: boolean;
 };
 
-function resolveAgentId(
-  cfg: Awaited<ReturnType<typeof requireValidConfig>>,
-  agentInput: string | undefined,
-  params?: { fallbackToDefault?: boolean },
-): string | null {
-  if (!cfg) {
-    return null;
-  }
-  if (agentInput?.trim()) {
-    return normalizeAgentId(agentInput);
-  }
-  if (params?.fallbackToDefault) {
-    return resolveDefaultAgentId(cfg);
-  }
-  return null;
+const agentBindingsModuleLoader = createLazyImportLoader<AgentBindingsModule>(
+  () => import("./agents.bindings.js"),
+);
+
+function loadAgentBindingsModule(): Promise<AgentBindingsModule> {
+  return agentBindingsModuleLoader.load();
 }
 
 function hasAgent(cfg: Awaited<ReturnType<typeof requireValidConfig>>, agentId: string): boolean {
   if (!cfg) {
     return false;
   }
-  return buildAgentSummaries(cfg).some((summary) => summary.id === agentId);
+  const targetAgentId = normalizeAgentId(agentId);
+  const agents = listAgentEntries(cfg);
+  if (agents.length === 0) {
+    return targetAgentId === normalizeAgentId(resolveDefaultAgentId(cfg));
+  }
+  return agents.some((agent) => normalizeAgentId(agent.id) === targetAgentId);
 }
 
 function formatBindingOwnerLine(binding: AgentRouteBinding): string {
@@ -62,20 +57,24 @@ function formatBindingOwnerLine(binding: AgentRouteBinding): string {
 }
 
 function resolveTargetAgentIdOrExit(params: {
-  cfg: Awaited<ReturnType<typeof requireValidConfig>>;
+  cfg: NonNullable<Awaited<ReturnType<typeof requireValidConfig>>>;
   runtime: RuntimeEnv;
   agentInput: string | undefined;
 }): string | null {
-  const agentId = resolveAgentId(params.cfg, params.agentInput?.trim(), {
-    fallbackToDefault: true,
-  });
-  if (!agentId) {
-    params.runtime.error("Unable to resolve agent id.");
+  const normalized =
+    params.agentInput === undefined ? null : normalizeAgentIdStrict(params.agentInput);
+  if (normalized && !normalized.ok) {
+    params.runtime.error(
+      `Agent "${params.agentInput}" not found. Run ${formatCliCommand("openclaw agents list")} to see configured agents.`,
+    );
     params.runtime.exit(1);
     return null;
   }
+  const agentId = normalized?.value ?? resolveDefaultAgentId(params.cfg);
   if (!hasAgent(params.cfg, agentId)) {
-    params.runtime.error(`Agent "${agentId}" not found.`);
+    params.runtime.error(
+      `Agent "${agentId}" not found. Run ${formatCliCommand("openclaw agents list")} to see configured agents.`,
+    );
     params.runtime.exit(1);
     return null;
   }
@@ -90,20 +89,24 @@ function formatBindingConflicts(
   );
 }
 
-function resolveParsedBindingsOrExit(params: {
+async function resolveParsedBindingsOrExit(params: {
   runtime: RuntimeEnv;
   cfg: NonNullable<Awaited<ReturnType<typeof requireValidConfig>>>;
   agentId: string;
   bindValues: string[] | undefined;
   emptyMessage: string;
-}): ReturnType<typeof parseBindingSpecs> | null {
-  const specs = (params.bindValues ?? []).map((value) => value.trim()).filter(Boolean);
+}): Promise<{
+  bindings: AgentRouteBinding[];
+  errors: string[];
+} | null> {
+  const specs = normalizeStringEntries(params.bindValues);
   if (specs.length === 0) {
     params.runtime.error(params.emptyMessage);
     params.runtime.exit(1);
     return null;
   }
 
+  const { parseBindingSpecs } = await loadAgentBindingsModule();
   const parsed = parseBindingSpecs({ agentId: params.agentId, specs, config: params.cfg });
   if (parsed.errors.length > 0) {
     params.runtime.error(parsed.errors.join("\n"));
@@ -153,23 +156,29 @@ async function resolveConfigAndTargetAgentIdOrExit(params: {
   return { cfg, agentId, baseHash: configSnapshot.hash };
 }
 
+/** List configured agent route bindings, optionally filtered by target agent. */
 export async function agentsBindingsCommand(
   opts: AgentsBindingsListOptions,
   runtime: RuntimeEnv = defaultRuntime,
 ) {
-  const cfg = await requireValidConfig(runtime);
+  const cfg = await requireValidConfig(runtime, { skipPluginValidation: true });
   if (!cfg) {
     return;
   }
 
-  const filterAgentId = resolveAgentId(cfg, opts.agent?.trim());
-  if (opts.agent && !filterAgentId) {
-    runtime.error("Agent id is required.");
+  const normalizedFilter = opts.agent === undefined ? null : normalizeAgentIdStrict(opts.agent);
+  if (normalizedFilter && !normalizedFilter.ok) {
+    runtime.error(
+      `Agent "${opts.agent}" not found. Run ${formatCliCommand("openclaw agents list")} to see configured agents.`,
+    );
     runtime.exit(1);
     return;
   }
+  const filterAgentId = normalizedFilter?.value;
   if (filterAgentId && !hasAgent(cfg, filterAgentId)) {
-    runtime.error(`Agent "${filterAgentId}" not found.`);
+    runtime.error(
+      `Agent "${filterAgentId}" not found. Run ${formatCliCommand("openclaw agents list")} to see configured agents.`,
+    );
     runtime.exit(1);
     return;
   }
@@ -204,6 +213,7 @@ export async function agentsBindingsCommand(
   );
 }
 
+/** Add route bindings for an agent and fail when another agent already owns the route. */
 export async function agentsBindCommand(
   opts: AgentsBindOptions,
   runtime: RuntimeEnv = defaultRuntime,
@@ -217,7 +227,7 @@ export async function agentsBindCommand(
   }
   const { cfg, agentId, baseHash } = resolved;
 
-  const parsed = resolveParsedBindingsOrExit({
+  const parsed = await resolveParsedBindingsOrExit({
     runtime,
     cfg,
     agentId,
@@ -228,6 +238,7 @@ export async function agentsBindCommand(
     return;
   }
 
+  const { applyAgentBindings } = await loadAgentBindingsModule();
   const result = applyAgentBindings(cfg, parsed.bindings);
   if (result.added.length > 0 || result.updated.length > 0) {
     await replaceConfigFile({
@@ -284,6 +295,7 @@ export async function agentsBindCommand(
   }
 }
 
+/** Remove selected route bindings, or all bindings owned by an agent with `--all`. */
 export async function agentsUnbindCommand(
   opts: AgentsUnbindOptions,
   runtime: RuntimeEnv = defaultRuntime,
@@ -308,6 +320,20 @@ export async function agentsUnbindCommand(
     const keptRoutes = existing.filter((binding) => normalizeAgentId(binding.agentId) !== agentId);
     const nonRoutes = (cfg.bindings ?? []).filter((binding) => !isRouteBinding(binding));
     if (removed.length === 0) {
+      if (
+        emitJsonPayload({
+          runtime,
+          json: opts.json,
+          payload: {
+            agentId,
+            removed: [] as string[],
+            missing: [] as string[],
+            conflicts: [] as string[],
+          },
+        })
+      ) {
+        return;
+      }
       runtime.log(`No bindings to remove for agent "${agentId}".`);
       return;
     }
@@ -336,7 +362,7 @@ export async function agentsUnbindCommand(
     return;
   }
 
-  const parsed = resolveParsedBindingsOrExit({
+  const parsed = await resolveParsedBindingsOrExit({
     runtime,
     cfg,
     agentId,
@@ -347,6 +373,7 @@ export async function agentsUnbindCommand(
     return;
   }
 
+  const { removeAgentBindings } = await loadAgentBindingsModule();
   const result = removeAgentBindings(cfg, parsed.bindings);
   if (result.removed.length > 0) {
     await replaceConfigFile({

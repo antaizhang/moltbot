@@ -1,33 +1,25 @@
-import {
-  createResolvedApproverActionAuthAdapter,
-  resolveApprovalApprovers,
-} from "openclaw/plugin-sdk/approval-runtime";
-import { resolveSlackAccount } from "./accounts.js";
-import { parseSlackTarget } from "./targets.js";
+// Slack plugin module implements approval auth behavior.
+import { createChannelApprovalAuth } from "openclaw/plugin-sdk/approval-auth-runtime";
+import { resolveSlackAccount, resolveSlackAccountAllowFrom } from "./accounts.js";
+import { normalizeSlackApproverId } from "./exec-approvals.js";
 
-function normalizeSlackApproverId(value: string | number): string | undefined {
-  const trimmed = String(value).trim();
-  if (!trimmed) {
-    return undefined;
-  }
-  try {
-    const target = parseSlackTarget(trimmed, { defaultKind: "user" });
-    return target?.kind === "user" ? target.id : undefined;
-  } catch {
-    return /^[A-Z0-9]+$/i.test(trimmed) ? trimmed : undefined;
-  }
-}
-
-export const slackApprovalAuth = createResolvedApproverActionAuthAdapter({
+const slackApproval = createChannelApprovalAuth({
   channelLabel: "Slack",
-  resolveApprovers: ({ cfg, accountId }) => {
+  resolveInputs: ({ cfg, accountId }) => {
     const account = resolveSlackAccount({ cfg, accountId }).config;
-    return resolveApprovalApprovers({
-      allowFrom: account.allowFrom,
-      extraAllowFrom: account.dm?.allowFrom,
+    return {
+      allowFrom: resolveSlackAccountAllowFrom({ cfg, accountId }),
       defaultTo: account.defaultTo,
-      normalizeApprover: normalizeSlackApproverId,
-    });
+    };
   },
-  normalizeSenderId: (value) => normalizeSlackApproverId(value),
+  normalizeApprover: normalizeSlackApproverId,
+  normalizeDefaultTo: normalizeSlackApproverId,
+  isWildcardAuthorized: ({ purpose, senderId, inputs, approvers }) =>
+    purpose === "sender" &&
+    Boolean(senderId) &&
+    approvers.length === 0 &&
+    inputs.allowFrom?.some((entry) => String(entry).trim() === "*") === true,
 });
+
+export const getSlackApprovalApprovers = slackApproval.resolveApprovers;
+export const isSlackApprovalAuthorizedSender = slackApproval.isAuthorizedSender;

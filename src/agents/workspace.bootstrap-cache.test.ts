@@ -1,7 +1,12 @@
+/**
+ * Integration coverage for workspace bootstrap cache reads.
+ * Uses temp workspaces to verify real file loading through the cache layer.
+ */
 import fs from "node:fs/promises";
 import path from "node:path";
-import { describe, expect, it, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { makeTempWorkspace, writeWorkspaceFile } from "../test-helpers/workspace.js";
+import { getOrLoadBootstrapFiles } from "./bootstrap-cache.js";
 import { loadWorkspaceBootstrapFiles, DEFAULT_AGENTS_FILENAME } from "./workspace.js";
 
 describe("workspace bootstrap file caching", () => {
@@ -13,6 +18,11 @@ describe("workspace bootstrap file caching", () => {
 
   const loadAgentsFile = async (dir: string) => {
     const result = await loadWorkspaceBootstrapFiles(dir);
+    return result.find((f) => f.name === DEFAULT_AGENTS_FILENAME);
+  };
+
+  const loadSessionAgentsFile = async (dir: string, sessionKey: string) => {
+    const result = await getOrLoadBootstrapFiles({ workspaceDir: dir, sessionKey });
     return result.find((f) => f.name === DEFAULT_AGENTS_FILENAME);
   };
 
@@ -74,6 +84,32 @@ describe("workspace bootstrap file caching", () => {
     expectAgentsContent(agentsFile2, content2);
   });
 
+  it("refreshes session bootstrap snapshots after workspace file changes", async () => {
+    const content1 = "# Initial content";
+    const content2 = "# Updated content";
+    const filePath = path.join(workspaceDir, DEFAULT_AGENTS_FILENAME);
+
+    await writeWorkspaceFile({
+      dir: workspaceDir,
+      name: DEFAULT_AGENTS_FILENAME,
+      content: content1,
+    });
+
+    const agentsFile1 = await loadSessionAgentsFile(workspaceDir, "agent:main:main");
+    expectAgentsContent(agentsFile1, content1);
+
+    await writeWorkspaceFile({
+      dir: workspaceDir,
+      name: DEFAULT_AGENTS_FILENAME,
+      content: content2,
+    });
+    const bumpedTime = new Date(Date.now() + 1_000);
+    await fs.utimes(filePath, bumpedTime, bumpedTime);
+
+    const agentsFile2 = await loadSessionAgentsFile(workspaceDir, "agent:main:main");
+    expectAgentsContent(agentsFile2, content2);
+  });
+
   it("invalidates cache when inode changes with same mtime", async () => {
     if (process.platform === "win32") {
       return;
@@ -100,6 +136,34 @@ describe("workspace bootstrap file caching", () => {
 
     const agentsFile2 = await loadAgentsFile(workspaceDir);
     expectAgentsContent(agentsFile2, content2);
+  });
+
+  it("replaces a session snapshot when inode changes with identical bytes", async () => {
+    if (process.platform === "win32") {
+      return;
+    }
+    const content = "# stable-content";
+    const filePath = path.join(workspaceDir, DEFAULT_AGENTS_FILENAME);
+    const tempPath = path.join(workspaceDir, ".AGENTS.replacement");
+    const sessionKey = "agent:main:identity-refresh";
+
+    await writeWorkspaceFile({
+      dir: workspaceDir,
+      name: DEFAULT_AGENTS_FILENAME,
+      content,
+    });
+    const originalStat = await fs.stat(filePath);
+    const agentsFile1 = await loadSessionAgentsFile(workspaceDir, sessionKey);
+    expectAgentsContent(agentsFile1, content);
+
+    await fs.writeFile(tempPath, content, "utf-8");
+    await fs.utimes(tempPath, originalStat.atime, originalStat.mtime);
+    await fs.rename(tempPath, filePath);
+    await fs.utimes(filePath, originalStat.atime, originalStat.mtime);
+
+    const agentsFile2 = await loadSessionAgentsFile(workspaceDir, sessionKey);
+    expectAgentsContent(agentsFile2, content);
+    expect(agentsFile2).not.toBe(agentsFile1);
   });
 
   it("handles file deletion gracefully", async () => {

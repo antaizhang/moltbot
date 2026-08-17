@@ -1,16 +1,27 @@
-import { resolveAgentConfig, resolveDefaultAgentId } from "../agents/agent-scope.js";
+// Summarizes heartbeat config for CLI and UI display.
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import {
+  listAgentEntries,
+  resolveAgentConfig,
+  tryResolveDefaultAgentId,
+} from "../agents/agent-scope.js";
 import {
   DEFAULT_HEARTBEAT_ACK_MAX_CHARS,
   DEFAULT_HEARTBEAT_EVERY,
-  resolveHeartbeatPrompt as resolveHeartbeatPromptText,
+  resolveHeartbeatPromptCore as resolveHeartbeatPromptText,
 } from "../auto-reply/heartbeat.js";
 import { parseDurationMs } from "../cli/parse-duration.js";
-import type { OpenClawConfig } from "../config/config.js";
+import { tryResolveLegacyCompatibilityAgentId } from "../config/legacy.default-agent-owner.js";
 import type { AgentDefaultsConfig } from "../config/types.agent-defaults.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { normalizeAgentId } from "../routing/session-key.js";
+import { resolveAmbientHeartbeatAgentId } from "./heartbeat-agent-resolution.js";
 
+// Heartbeat summaries merge default and per-agent heartbeat config for CLI/UI
+// display without scheduling any work.
 type HeartbeatConfig = AgentDefaultsConfig["heartbeat"];
 
+/** Normalized heartbeat configuration for one agent. */
 export type HeartbeatSummary = {
   enabled: boolean;
   every: string;
@@ -18,28 +29,42 @@ export type HeartbeatSummary = {
   prompt: string;
   target: string;
   model?: string;
+  session?: string;
   ackMaxChars: number;
 };
 
-const DEFAULT_HEARTBEAT_TARGET = "none";
+const DEFAULT_HEARTBEAT_TARGET = "owner";
 
 function hasExplicitHeartbeatAgents(cfg: OpenClawConfig) {
-  const list = cfg.agents?.list ?? [];
+  const list = listAgentEntries(cfg);
   return list.some((entry) => Boolean(entry?.heartbeat));
 }
 
+/** Return whether heartbeat scheduling applies to an agent. */
 export function isHeartbeatEnabledForAgent(cfg: OpenClawConfig, agentId?: string): boolean {
-  const resolvedAgentId = normalizeAgentId(agentId ?? resolveDefaultAgentId(cfg));
-  const list = cfg.agents?.list ?? [];
+  const ambientAgentId =
+    agentId === undefined
+      ? resolveAmbientHeartbeatAgentId(cfg)
+      : (tryResolveLegacyCompatibilityAgentId(cfg) ?? tryResolveDefaultAgentId(cfg));
+  const resolvedAgentId = normalizeAgentId(agentId ?? ambientAgentId);
+  const list = listAgentEntries(cfg);
   const hasExplicit = hasExplicitHeartbeatAgents(cfg);
   if (hasExplicit) {
     return list.some(
       (entry) => Boolean(entry?.heartbeat) && normalizeAgentId(entry?.id) === resolvedAgentId,
     );
   }
-  return resolvedAgentId === resolveDefaultAgentId(cfg);
+  if (cfg.agents?.defaults?.heartbeat) {
+    const configuredAgentId = normalizeOptionalString(cfg.agents.defaults.heartbeat.agentId);
+    if (configuredAgentId) {
+      return resolvedAgentId === normalizeAgentId(configuredAgentId);
+    }
+    return true;
+  }
+  return ambientAgentId !== undefined && resolvedAgentId === ambientAgentId;
 }
 
+/** Resolve a heartbeat interval string to milliseconds. */
 export function resolveHeartbeatIntervalMs(
   cfg: OpenClawConfig,
   overrideEvery?: string,
@@ -53,7 +78,7 @@ export function resolveHeartbeatIntervalMs(
   if (!raw) {
     return null;
   }
-  const trimmed = String(raw).trim();
+  const trimmed = normalizeOptionalString(raw) ?? "";
   if (!trimmed) {
     return null;
   }
@@ -69,12 +94,14 @@ export function resolveHeartbeatIntervalMs(
   return ms;
 }
 
+/** Resolve display-ready heartbeat settings for an agent. */
 export function resolveHeartbeatSummaryForAgent(
   cfg: OpenClawConfig,
   agentId?: string,
 ): HeartbeatSummary {
   const defaults = cfg.agents?.defaults?.heartbeat;
   const overrides = agentId ? resolveAgentConfig(cfg, agentId)?.heartbeat : undefined;
+  const merged = defaults || overrides ? { ...defaults, ...overrides } : undefined;
   const enabled = isHeartbeatEnabledForAgent(cfg, agentId);
 
   if (!enabled) {
@@ -82,29 +109,21 @@ export function resolveHeartbeatSummaryForAgent(
       enabled: false,
       every: "disabled",
       everyMs: null,
-      prompt: resolveHeartbeatPromptText(defaults?.prompt),
-      target: defaults?.target ?? DEFAULT_HEARTBEAT_TARGET,
-      model: defaults?.model,
-      ackMaxChars: Math.max(0, defaults?.ackMaxChars ?? DEFAULT_HEARTBEAT_ACK_MAX_CHARS),
+      prompt: resolveHeartbeatPromptText(merged?.prompt),
+      target: merged?.target ?? DEFAULT_HEARTBEAT_TARGET,
+      model: merged?.model,
+      session: merged?.session,
+      ackMaxChars: DEFAULT_HEARTBEAT_ACK_MAX_CHARS,
     };
   }
 
-  const merged = defaults || overrides ? { ...defaults, ...overrides } : undefined;
-  const every = merged?.every ?? defaults?.every ?? overrides?.every ?? DEFAULT_HEARTBEAT_EVERY;
+  const every = merged?.every ?? DEFAULT_HEARTBEAT_EVERY;
   const everyMs = resolveHeartbeatIntervalMs(cfg, undefined, merged);
-  const prompt = resolveHeartbeatPromptText(
-    merged?.prompt ?? defaults?.prompt ?? overrides?.prompt,
-  );
-  const target =
-    merged?.target ?? defaults?.target ?? overrides?.target ?? DEFAULT_HEARTBEAT_TARGET;
-  const model = merged?.model ?? defaults?.model ?? overrides?.model;
-  const ackMaxChars = Math.max(
-    0,
-    merged?.ackMaxChars ??
-      defaults?.ackMaxChars ??
-      overrides?.ackMaxChars ??
-      DEFAULT_HEARTBEAT_ACK_MAX_CHARS,
-  );
+  const prompt = resolveHeartbeatPromptText(merged?.prompt);
+  const target = merged?.target ?? DEFAULT_HEARTBEAT_TARGET;
+  const model = merged?.model;
+  const session = merged?.session;
+  const ackMaxChars = DEFAULT_HEARTBEAT_ACK_MAX_CHARS;
 
   return {
     enabled: true,
@@ -113,6 +132,7 @@ export function resolveHeartbeatSummaryForAgent(
     prompt,
     target,
     model,
+    session,
     ackMaxChars,
   };
 }

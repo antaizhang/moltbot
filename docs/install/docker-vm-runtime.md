@@ -3,76 +3,47 @@ summary: "Shared Docker VM runtime steps for long-lived OpenClaw Gateway hosts"
 read_when:
   - You are deploying OpenClaw on a cloud VM with Docker
   - You need the shared binary bake, persistence, and update flow
-title: "Docker VM Runtime"
+title: "Docker VM runtime"
 ---
-
-# Docker VM Runtime
 
 Shared runtime steps for VM-based Docker installs such as GCP, Hetzner, and similar VPS providers.
 
 ## Bake required binaries into the image
 
-Installing binaries inside a running container is a trap.
-Anything installed at runtime will be lost on restart.
+Installing binaries inside a running container is a trap: anything installed
+at runtime is lost on restart. Bake every external binary a skill needs into
+the image at build time.
 
-All external binaries required by skills must be installed at image build time.
+The examples below cover three binaries only, alphabetically:
 
-The examples below show three common binaries only:
-
-- `gog` for Gmail access
+- `gog` (from `gogcli`) for Gmail access
 - `goplaces` for Google Places
 - `wacli` for WhatsApp
 
-These are examples, not a complete list.
-You may install as many binaries as needed using the same pattern.
+These are examples, not a complete list. Docker Compose builds the repo-root
+`Dockerfile`, so extend that file rather than creating a standalone example or
+replacing its contents. The repository Dockerfile has required
+`workspace-deps`, build, runtime-assets, and final runtime stages. Its manifest
+extraction covers the `packages/*` and selected `extensions/*` workspaces before
+`pnpm install --frozen-lockfile`.
 
-If you add new skills later that depend on additional binaries, you must:
+For Debian packages, prefer the existing build argument:
 
-1. Update the Dockerfile
-2. Rebuild the image
-3. Restart the containers
-
-**Example Dockerfile**
-
-```dockerfile
-FROM node:24-bookworm
-
-RUN apt-get update && apt-get install -y socat && rm -rf /var/lib/apt/lists/*
-
-# Example binary 1: Gmail CLI
-RUN curl -L https://github.com/steipete/gog/releases/latest/download/gog_Linux_x86_64.tar.gz \
-  | tar -xz -C /usr/local/bin && chmod +x /usr/local/bin/gog
-
-# Example binary 2: Google Places CLI
-RUN curl -L https://github.com/steipete/goplaces/releases/latest/download/goplaces_Linux_x86_64.tar.gz \
-  | tar -xz -C /usr/local/bin && chmod +x /usr/local/bin/goplaces
-
-# Example binary 3: WhatsApp CLI
-RUN curl -L https://github.com/steipete/wacli/releases/latest/download/wacli_Linux_x86_64.tar.gz \
-  | tar -xz -C /usr/local/bin && chmod +x /usr/local/bin/wacli
-
-# Add more binaries below using the same pattern
-
-WORKDIR /app
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
-COPY ui/package.json ./ui/package.json
-COPY scripts ./scripts
-
-RUN corepack enable
-RUN pnpm install --frozen-lockfile
-
-COPY . .
-RUN pnpm build
-RUN pnpm ui:install
-RUN pnpm ui:build
-
-ENV NODE_ENV=production
-
-CMD ["node","dist/index.js"]
+```bash
+export OPENCLAW_IMAGE_APT_PACKAGES="socat"
 ```
 
+For downloaded release binaries such as `gog`, `goplaces`, or `wacli`, add the
+download and install commands to the repo-root `Dockerfile` final runtime stage,
+after its package-install blocks and before `USER node`. Preserve the existing
+non-root uid 1000 setup, `tini` entrypoint, health check, and `openclaw` symlink.
+Then rebuild and restart the containers.
+
 <Note>
-The download URLs above are for x86_64 (amd64). For ARM-based VMs (e.g. Hetzner ARM, GCP Tau T2A), replace the download URLs with the appropriate ARM64 variants from each tool's release page.
+The repository Dockerfile digest-pins its Node and Bun base images. Keep those
+reviewed pins instead of changing them to floating `FROM node:24-bookworm`
+references. For ARM-based VMs, choose `arm64` release assets for extra binaries;
+for reproducible builds, use versioned asset URLs and verify their checksums.
 </Note>
 
 ## Build and launch
@@ -82,8 +53,7 @@ docker compose build
 docker compose up -d openclaw-gateway
 ```
 
-If build fails with `Killed` or `exit code 137` during `pnpm install --frozen-lockfile`, the VM is out of memory.
-Use a larger machine class before retrying.
+If the build fails with `Killed` or exit code 137 during `pnpm install --frozen-lockfile`, the VM is out of memory. Use a larger machine class before retrying.
 
 Verify binaries:
 
@@ -95,41 +65,40 @@ docker compose exec openclaw-gateway which wacli
 
 Expected output:
 
-```
+```text
 /usr/local/bin/gog
 /usr/local/bin/goplaces
 /usr/local/bin/wacli
 ```
 
-Verify Gateway:
+Verify the gateway is up:
 
 ```bash
 docker compose logs -f openclaw-gateway
+curl -fsS http://127.0.0.1:18789/healthz
 ```
 
-Expected output:
-
-```
-[gateway] listening on ws://0.0.0.0:18789
-```
+`/healthz` returning a 200 response confirms the gateway process is listening and healthy; the built-in image `HEALTHCHECK` polls the same endpoint.
 
 ## What persists where
 
-OpenClaw runs in Docker, but Docker is not the source of truth.
-All long-lived state must survive restarts, rebuilds, and reboots.
+OpenClaw runs in Docker, but Docker is not the source of truth. All long-lived state must survive restarts, rebuilds, and reboots.
 
-| Component           | Location                          | Persistence mechanism  | Notes                            |
-| ------------------- | --------------------------------- | ---------------------- | -------------------------------- |
-| Gateway config      | `/home/node/.openclaw/`           | Host volume mount      | Includes `openclaw.json`, tokens |
-| Model auth profiles | `/home/node/.openclaw/`           | Host volume mount      | OAuth tokens, API keys           |
-| Skill configs       | `/home/node/.openclaw/skills/`    | Host volume mount      | Skill-level state                |
-| Agent workspace     | `/home/node/.openclaw/workspace/` | Host volume mount      | Code and agent artifacts         |
-| WhatsApp session    | `/home/node/.openclaw/`           | Host volume mount      | Preserves QR login               |
-| Gmail keyring       | `/home/node/.openclaw/`           | Host volume + password | Requires `GOG_KEYRING_PASSWORD`  |
-| External binaries   | `/usr/local/bin/`                 | Docker image           | Must be baked at build time      |
-| Node runtime        | Container filesystem              | Docker image           | Rebuilt every image build        |
-| OS packages         | Container filesystem              | Docker image           | Do not install at runtime        |
-| Docker container    | Ephemeral                         | Restartable            | Safe to destroy                  |
+| Component              | Location                                               | Persistence mechanism  | Notes                                                                                                               |
+| ---------------------- | ------------------------------------------------------ | ---------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| Gateway config         | `/home/node/.openclaw/`                                | Host volume mount      | Includes `openclaw.json`                                                                                            |
+| Channel/provider creds | `/home/node/.openclaw/credentials/`                    | Host volume mount      | Channel and provider credential material                                                                            |
+| Model auth profiles    | `/home/node/.openclaw/agents/`                         | Host volume mount      | `agents/<agentId>/agent/auth-profiles.json` (OAuth, API keys)                                                       |
+| Legacy OAuth key file  | `/home/node/.config/openclaw/`                         | Host volume mount      | Read-only compat for pre-migration OAuth sidecars; `openclaw doctor --fix` migrates these into `auth-profiles.json` |
+| Skill configs          | `/home/node/.openclaw/skills/`                         | Host volume mount      | Skill-level state                                                                                                   |
+| Agent workspace        | `/home/node/.openclaw/workspace/`                      | Host volume mount      | Code and agent artifacts                                                                                            |
+| WhatsApp session       | `/home/node/.openclaw/`                                | Host volume mount      | Preserves QR login                                                                                                  |
+| Gmail keyring          | `/home/node/.openclaw/`                                | Host volume + password | Requires `GOG_KEYRING_PASSWORD`                                                                                     |
+| Plugin packages        | `/home/node/.openclaw/npm`, `/home/node/.openclaw/git` | Host volume mount      | Downloadable plugin package roots                                                                                   |
+| External binaries      | `/usr/local/bin/`                                      | Docker image           | Must be baked at build time                                                                                         |
+| Node runtime           | Container filesystem                                   | Docker image           | Rebuilt every image build                                                                                           |
+| OS packages            | Container filesystem                                   | Docker image           | Do not install at runtime                                                                                           |
+| Docker container       | Ephemeral                                              | Restartable            | Safe to destroy                                                                                                     |
 
 ## Updates
 
@@ -140,3 +109,9 @@ git pull
 docker compose build
 docker compose up -d
 ```
+
+## Related
+
+- [Docker](/install/docker)
+- [Podman](/install/podman)
+- [ClawDock](/install/clawdock)

@@ -1,8 +1,16 @@
+// Gateway hook mapping resolver.
+// Normalizes hook presets, templates, transforms, and resolved hook actions.
 import fs from "node:fs";
 import path from "node:path";
-import { CONFIG_PATH, type HookMappingConfig, type HooksConfig } from "../config/config.js";
+import {
+  normalizeOptionalString,
+  readStringValue,
+} from "@openclaw/normalization-core/string-coerce";
+import { resolveConfigPathCandidate } from "../config/paths.js";
+import type { HookMappingConfig, HooksConfig, HookSessionMode } from "../config/types.hooks.js";
 import { importFileModule, resolveFunctionModuleExport } from "../hooks/module-loader.js";
-import type { HookMessageChannel } from "./hooks.js";
+import { isPathInside } from "../infra/path-guards.js";
+import type { HookMessageChannel } from "./hooks.types.js";
 
 export type HookMappingResolved = {
   id: string;
@@ -13,6 +21,7 @@ export type HookMappingResolved = {
   name?: string;
   agentId?: string;
   sessionKey?: string;
+  sessionMode?: HookSessionMode;
   messageTemplate?: string;
   textTemplate?: string;
   deliver?: boolean;
@@ -25,23 +34,26 @@ export type HookMappingResolved = {
   transform?: HookMappingTransformResolved;
 };
 
-export type HookMappingTransformResolved = {
+type HookMappingTransformResolved = {
   modulePath: string;
   exportName?: string;
 };
 
-export type HookMappingContext = {
+type HookMappingContext = {
   payload: Record<string, unknown>;
   headers: Record<string, string>;
   url: URL;
   path: string;
 };
 
-export type HookAction =
+type HookAction =
   | {
       kind: "wake";
       text: string;
       mode: "now" | "next-heartbeat";
+      agentId?: string;
+      sessionKey?: string;
+      sessionKeySource?: "static" | "templated";
     }
   | {
       kind: "agent";
@@ -50,6 +62,8 @@ export type HookAction =
       agentId?: string;
       wakeMode: "now" | "next-heartbeat";
       sessionKey?: string;
+      sessionKeySource?: "static" | "templated";
+      sessionMode: HookSessionMode;
       deliver?: boolean;
       allowUnsafeExternalContent?: boolean;
       channel?: HookMessageChannel;
@@ -59,7 +73,9 @@ export type HookAction =
       timeoutSeconds?: number;
     };
 
-export type HookMappingResult =
+type HookSessionKeyTemplateSource = "static" | "templated";
+
+type HookMappingResult =
   | { ok: true; action: HookAction }
   | { ok: true; action: null; skipped: true }
   | { ok: false; error: string };
@@ -80,6 +96,12 @@ const hookPresetMappings: Record<string, HookMappingConfig[]> = {
 };
 
 const transformCache = new Map<string, HookTransformFn>();
+let transformCacheBustVersion = 0;
+
+export function commitHookTransformMappingReload(): void {
+  transformCache.clear();
+  transformCacheBustVersion += 1;
+}
 
 type HookTransformResult = Partial<{
   kind: HookAction["kind"];
@@ -90,6 +112,8 @@ type HookTransformResult = Partial<{
   wakeMode: "now" | "next-heartbeat";
   name: string;
   sessionKey: string;
+  sessionKeySource: HookSessionKeyTemplateSource;
+  sessionMode: HookSessionMode;
   deliver: boolean;
   allowUnsafeExternalContent: boolean;
   channel: HookMessageChannel;
@@ -103,6 +127,7 @@ type HookTransformFn = (
   ctx: HookMappingContext,
 ) => HookTransformResult | Promise<HookTransformResult>;
 
+/** Resolve configured hook mappings plus preset mappings into normalized matcher entries. */
 export function resolveHookMappings(
   hooks?: HooksConfig,
   opts?: { configDir?: string },
@@ -133,7 +158,7 @@ export function resolveHookMappings(
     return [];
   }
 
-  const configDir = path.resolve(opts?.configDir ?? path.dirname(CONFIG_PATH));
+  const configDir = path.resolve(opts?.configDir ?? path.dirname(resolveConfigPathCandidate()));
   const transformsRootDir = path.join(configDir, "hooks", "transforms");
   const transformsDir = resolveOptionalContainedPath(
     transformsRootDir,
@@ -187,7 +212,7 @@ function normalizeHookMapping(
   index: number,
   transformsDir: string,
 ): HookMappingResolved {
-  const id = mapping.id?.trim() || `mapping-${index + 1}`;
+  const id = normalizeOptionalString(mapping.id) || `mapping-${index + 1}`;
   const matchPath = normalizeMatchPath(mapping.match?.path);
   const matchSource = mapping.match?.source?.trim();
   const action = mapping.action ?? "agent";
@@ -195,7 +220,7 @@ function normalizeHookMapping(
   const transform = mapping.transform
     ? {
         modulePath: resolveContainedPath(transformsDir, mapping.transform.module, "Hook transform"),
-        exportName: mapping.transform.export?.trim() || undefined,
+        exportName: normalizeOptionalString(mapping.transform.export),
       }
     : undefined;
 
@@ -206,8 +231,9 @@ function normalizeHookMapping(
     action,
     wakeMode,
     name: mapping.name,
-    agentId: mapping.agentId?.trim() || undefined,
+    agentId: normalizeOptionalString(mapping.agentId),
     sessionKey: mapping.sessionKey,
+    sessionMode: mapping.sessionMode,
     messageTemplate: mapping.messageTemplate,
     textTemplate: mapping.textTemplate,
     deliver: mapping.deliver,
@@ -228,7 +254,7 @@ function mappingMatches(mapping: HookMappingResolved, ctx: HookMappingContext) {
     }
   }
   if (mapping.matchSource) {
-    const source = typeof ctx.payload.source === "string" ? ctx.payload.source : undefined;
+    const source = readStringValue(ctx.payload.source);
     if (!source || source !== mapping.matchSource) {
       return false;
     }
@@ -248,6 +274,9 @@ function buildActionFromMapping(
         kind: "wake",
         text,
         mode: mapping.wakeMode ?? "now",
+        agentId: mapping.agentId,
+        sessionKey: renderOptional(mapping.sessionKey, ctx),
+        sessionKeySource: getSessionKeyTemplateSource(mapping.sessionKey),
       },
     };
   }
@@ -261,6 +290,8 @@ function buildActionFromMapping(
       agentId: mapping.agentId,
       wakeMode: mapping.wakeMode ?? "now",
       sessionKey: renderOptional(mapping.sessionKey, ctx),
+      sessionKeySource: getSessionKeyTemplateSource(mapping.sessionKey),
+      sessionMode: mapping.sessionMode ?? "isolated",
       deliver: mapping.deliver,
       allowUnsafeExternalContent: mapping.allowUnsafeExternalContent,
       channel: mapping.channel,
@@ -285,7 +316,14 @@ function mergeAction(
     const baseWake = base.kind === "wake" ? base : undefined;
     const text = typeof override.text === "string" ? override.text : (baseWake?.text ?? "");
     const mode = override.mode === "next-heartbeat" ? "next-heartbeat" : (baseWake?.mode ?? "now");
-    return validateAction({ kind: "wake", text, mode });
+    return validateAction({
+      kind: "wake",
+      text,
+      mode,
+      agentId: override.agentId ?? baseWake?.agentId,
+      sessionKey: override.sessionKey ?? baseWake?.sessionKey,
+      sessionKeySource: resolveMergedSessionKeySource(baseWake, override),
+    });
   }
   const baseAgent = base.kind === "agent" ? base : undefined;
   const message =
@@ -299,6 +337,8 @@ function mergeAction(
     name: override.name ?? baseAgent?.name,
     agentId: override.agentId ?? baseAgent?.agentId,
     sessionKey: override.sessionKey ?? baseAgent?.sessionKey,
+    sessionKeySource: resolveMergedSessionKeySource(baseAgent, override),
+    sessionMode: override.sessionMode ?? baseAgent?.sessionMode ?? "isolated",
     deliver: typeof override.deliver === "boolean" ? override.deliver : baseAgent?.deliver,
     allowUnsafeExternalContent:
       typeof override.allowUnsafeExternalContent === "boolean"
@@ -313,16 +353,58 @@ function mergeAction(
 }
 
 function validateAction(action: HookAction): HookMappingResult {
+  if (action.sessionKeySource === "templated" && !action.sessionKey?.trim()) {
+    return { ok: false, error: "hook mapping sessionKey template rendered empty" };
+  }
   if (action.kind === "wake") {
     if (!action.text?.trim()) {
       return { ok: false, error: "hook mapping requires text" };
+    }
+    if (action.mode === "next-heartbeat" && action.sessionKey) {
+      return {
+        ok: false,
+        error: "hook mapping sessionKey requires wakeMode=now",
+      };
     }
     return { ok: true, action };
   }
   if (!action.message?.trim()) {
     return { ok: false, error: "hook mapping requires message" };
   }
+  if (action.sessionMode !== "isolated" && action.sessionMode !== "persistent") {
+    return { ok: false, error: "hook mapping sessionMode must be isolated or persistent" };
+  }
   return { ok: true, action };
+}
+
+function getSessionKeyTemplateSource(
+  sessionKeyTemplate: string | undefined,
+): HookSessionKeyTemplateSource | undefined {
+  const normalizedTemplate = normalizeOptionalString(sessionKeyTemplate);
+  if (!normalizedTemplate) {
+    return undefined;
+  }
+  return hasHookTemplateExpressions(normalizedTemplate) ? "templated" : "static";
+}
+
+function resolveMergedSessionKeySource(
+  baseAction: HookAction | undefined,
+  override: Exclude<HookTransformResult, null>,
+): HookSessionKeyTemplateSource | undefined {
+  if (typeof override.sessionKey === "string") {
+    const normalizedSessionKey = normalizeOptionalString(override.sessionKey);
+    if (!normalizedSessionKey) {
+      // Empty transform overrides behave like an absent sessionKey and fall
+      // through to the default/generated key path later in hook dispatch.
+      return undefined;
+    }
+    return override.sessionKeySource === "static" ? "static" : "templated";
+  }
+  return baseAction?.sessionKeySource;
+}
+
+export function hasHookTemplateExpressions(template: string): boolean {
+  return /\{\{\s*[^}]+\s*\}\}/.test(template);
 }
 
 async function loadTransform(transform: HookMappingTransformResolved): Promise<HookTransformFn> {
@@ -331,9 +413,16 @@ async function loadTransform(transform: HookMappingTransformResolved): Promise<H
   if (cached) {
     return cached;
   }
-  const mod = await importFileModule({ modulePath: transform.modulePath });
+  const generation = transformCacheBustVersion;
+  const mod = await importFileModule({
+    modulePath: transform.modulePath,
+    cacheBust: true,
+    nowMs: generation,
+  });
   const fn = resolveTransformFn(mod, transform.exportName);
-  transformCache.set(cacheKey, fn);
+  if (generation === transformCacheBustVersion) {
+    transformCache.set(cacheKey, fn);
+  }
   return fn;
 }
 
@@ -356,13 +445,10 @@ function resolvePath(baseDir: string, target: string): string {
   return path.isAbsolute(target) ? path.resolve(target) : path.resolve(baseDir, target);
 }
 
-function escapesBase(baseDir: string, candidate: string): boolean {
-  const relative = path.relative(baseDir, candidate);
-  return relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
-}
-
 function safeRealpathSync(candidate: string): string | null {
   try {
+    // Hook containment prefers native canonicalization when Node exposes it.
+    // Keep the plain fallback only for runtimes without the native entrypoint.
     const nativeRealpath = fs.realpathSync.native as ((path: string) => string) | undefined;
     return nativeRealpath ? nativeRealpath(candidate) : fs.realpathSync(candidate);
   } catch {
@@ -391,7 +477,7 @@ function resolveContainedPath(baseDir: string, target: string, label: string): s
     throw new Error(`${label} module path is required`);
   }
   const resolved = resolvePath(base, trimmed);
-  if (escapesBase(base, resolved)) {
+  if (!isPathInside(base, resolved)) {
     throw new Error(`${label} module path must be within ${base}: ${target}`);
   }
 
@@ -403,7 +489,7 @@ function resolveContainedPath(baseDir: string, target: string, label: string): s
   if (
     baseRealpath &&
     existingAncestorRealpath &&
-    escapesBase(baseRealpath, existingAncestorRealpath)
+    !isPathInside(baseRealpath, existingAncestorRealpath)
   ) {
     throw new Error(`${label} module path must be within ${base}: ${target}`);
   }

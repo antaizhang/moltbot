@@ -1,7 +1,17 @@
+/**
+ * Browser CLI debugging commands for highlights, errors, requests, and traces.
+ */
 import type { Command } from "commander";
-import { runCommandWithRuntime } from "../core-api.js";
-import { callBrowserRequest, type BrowserParentOpts } from "./browser-cli-shared.js";
-import { danger, defaultRuntime, shortenHomePath } from "./core-api.js";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  BROWSER_TAB_REFERENCE_HELP,
+  callBrowserRequest,
+  printBrowserJsonResult as printJsonResult,
+  resolveBrowserProfileQuery as resolveProfileQuery,
+  runBrowserCliCommand,
+  type BrowserParentOpts,
+} from "./browser-cli-shared.js";
+import { defaultRuntime, shortenHomePath } from "./core-api.js";
 
 const BROWSER_DEBUG_TIMEOUT_MS = 20000;
 
@@ -12,33 +22,18 @@ type DebugContext = {
   profile?: string;
 };
 
-function runBrowserDebug(action: () => Promise<void>) {
-  return runCommandWithRuntime(defaultRuntime, action, (err) => {
-    defaultRuntime.error(danger(String(err as unknown)));
-    defaultRuntime.exit(1);
-  });
-}
-
 async function withDebugContext(
   cmd: Command,
   parentOpts: (cmd: Command) => BrowserParentOpts,
   action: (context: DebugContext) => Promise<void>,
 ) {
   const parent = parentOpts(cmd);
-  await runBrowserDebug(() =>
+  await runBrowserCliCommand(() =>
     action({
       parent,
       profile: parent.browserProfile,
     }),
   );
-}
-
-function printJsonResult(parent: BrowserParentOpts, result: unknown): boolean {
-  if (!parent.json) {
-    return false;
-  }
-  defaultRuntime.writeJson(result);
-  return true;
 }
 
 async function callDebugRequest<T>(
@@ -48,10 +43,6 @@ async function callDebugRequest<T>(
   return callBrowserRequest<T>(parent, params, { timeoutMs: BROWSER_DEBUG_TIMEOUT_MS });
 }
 
-function resolveProfileQuery(profile?: string) {
-  return profile ? { profile } : undefined;
-}
-
 function resolveDebugQuery(params: {
   targetId?: unknown;
   clear?: unknown;
@@ -59,13 +50,14 @@ function resolveDebugQuery(params: {
   filter?: unknown;
 }) {
   return {
-    targetId: typeof params.targetId === "string" ? params.targetId.trim() || undefined : undefined,
-    filter: typeof params.filter === "string" ? params.filter.trim() || undefined : undefined,
+    targetId: normalizeOptionalString(params.targetId),
+    filter: normalizeOptionalString(params.filter),
     clear: Boolean(params.clear),
     profile: params.profile,
   };
 }
 
+/** Registers Browser debugging and trace commands. */
 export function registerBrowserDebugCommands(
   browser: Command,
   parentOpts: (cmd: Command) => BrowserParentOpts,
@@ -74,7 +66,7 @@ export function registerBrowserDebugCommands(
     .command("highlight")
     .description("Highlight an element by ref")
     .argument("<ref>", "Ref id from snapshot")
-    .option("--target-id <id>", "CDP target id (or unique prefix)")
+    .option("--target-id <id>", BROWSER_TAB_REFERENCE_HELP)
     .action(async (ref: string, opts, cmd) => {
       await withDebugContext(cmd, parentOpts, async ({ parent, profile }) => {
         const result = await callDebugRequest(parent, {
@@ -83,7 +75,7 @@ export function registerBrowserDebugCommands(
           query: resolveProfileQuery(profile),
           body: {
             ref: ref.trim(),
-            targetId: opts.targetId?.trim() || undefined,
+            targetId: normalizeOptionalString(opts.targetId),
           },
         });
         if (printJsonResult(parent, result)) {
@@ -97,7 +89,7 @@ export function registerBrowserDebugCommands(
     .command("errors")
     .description("Get recent page errors")
     .option("--clear", "Clear stored errors after reading", false)
-    .option("--target-id <id>", "CDP target id (or unique prefix)")
+    .option("--target-id <id>", BROWSER_TAB_REFERENCE_HELP)
     .action(async (opts, cmd) => {
       await withDebugContext(cmd, parentOpts, async ({ parent, profile }) => {
         const result = await callDebugRequest<{
@@ -131,7 +123,7 @@ export function registerBrowserDebugCommands(
     .description("Get recent network requests (best-effort)")
     .option("--filter <text>", "Only show URLs that contain this substring")
     .option("--clear", "Clear stored requests after reading", false)
-    .option("--target-id <id>", "CDP target id (or unique prefix)")
+    .option("--target-id <id>", BROWSER_TAB_REFERENCE_HELP)
     .action(async (opts, cmd) => {
       await withDebugContext(cmd, parentOpts, async ({ parent, profile }) => {
         const result = await callDebugRequest<{
@@ -178,7 +170,7 @@ export function registerBrowserDebugCommands(
   trace
     .command("start")
     .description("Start trace recording")
-    .option("--target-id <id>", "CDP target id (or unique prefix)")
+    .option("--target-id <id>", BROWSER_TAB_REFERENCE_HELP)
     .option("--no-screenshots", "Disable screenshots")
     .option("--no-snapshots", "Disable snapshots")
     .option("--sources", "Include sources (bigger traces)", false)
@@ -189,7 +181,7 @@ export function registerBrowserDebugCommands(
           path: "/trace/start",
           query: resolveProfileQuery(profile),
           body: {
-            targetId: opts.targetId?.trim() || undefined,
+            targetId: normalizeOptionalString(opts.targetId),
             screenshots: Boolean(opts.screenshots),
             snapshots: Boolean(opts.snapshots),
             sources: Boolean(opts.sources),
@@ -209,7 +201,7 @@ export function registerBrowserDebugCommands(
       "--out <path>",
       "Output path within openclaw temp dir (e.g. trace.zip or /tmp/openclaw/trace.zip)",
     )
-    .option("--target-id <id>", "CDP target id (or unique prefix)")
+    .option("--target-id <id>", BROWSER_TAB_REFERENCE_HELP)
     .action(async (opts, cmd) => {
       await withDebugContext(cmd, parentOpts, async ({ parent, profile }) => {
         const result = await callDebugRequest<{ path: string }>(parent, {
@@ -217,8 +209,8 @@ export function registerBrowserDebugCommands(
           path: "/trace/stop",
           query: resolveProfileQuery(profile),
           body: {
-            targetId: opts.targetId?.trim() || undefined,
-            path: opts.out?.trim() || undefined,
+            targetId: normalizeOptionalString(opts.targetId),
+            path: normalizeOptionalString(opts.out),
           },
         });
         if (printJsonResult(parent, result)) {

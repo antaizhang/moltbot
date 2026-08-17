@@ -2,52 +2,97 @@
 
 set -euo pipefail
 
-mode="${1:-}"
+usage() {
+  echo "usage: bash scripts/openclaw-npm-publish.sh --publish [package.tgz]"
+}
 
-if [[ "${mode}" != "--publish" ]]; then
-  echo "usage: bash scripts/openclaw-npm-publish.sh --publish" >&2
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ "${1:-}" != "--publish" ]]; then
+  usage >&2
+  exit 2
+fi
+shift
+
+publish_target=""
+if [[ "${1:-}" == "--" ]]; then
+  shift
+fi
+if [[ "$#" -gt 0 ]]; then
+  case "$1" in
+    -*) echo "error: unexpected npm publish target option: $1" >&2; exit 2 ;;
+    *) publish_target="$1"; shift ;;
+  esac
+fi
+if [[ "$#" -gt 0 ]]; then
+  echo "error: unexpected npm publish argument: $1" >&2
   exit 2
 fi
 
+if [[ -n "${publish_target}" && -f "${publish_target}" ]]; then
+  case "${publish_target}" in
+    /*|./*|../*) ;;
+    *) publish_target="./${publish_target}" ;;
+  esac
+fi
+
 package_version="$(node -p "require('./package.json').version")"
-current_beta_version="$(npm view openclaw dist-tags.beta 2>/dev/null || true)"
-mapfile -t publish_plan < <(
-  PACKAGE_VERSION="${package_version}" CURRENT_BETA_VERSION="${current_beta_version}" node --import tsx --input-type=module <<'EOF'
-import { resolveNpmPublishPlan } from "./scripts/openclaw-npm-release-check.ts";
+if [[ -n "${publish_target}" ]]; then
+  if [[ ! -f "${publish_target}" ]]; then
+    echo "error: npm publish tarball not found: ${publish_target}" >&2
+    exit 2
+  fi
+  if ! tarball_package_json="$(tar -xOf "${publish_target}" package/package.json)"; then
+    echo "error: npm publish tarball is missing a readable package/package.json: ${publish_target}" >&2
+    exit 2
+  fi
+  if ! tarball_package_version="$(printf '%s' "${tarball_package_json}" | node -e '
+    let input = "";
+    process.stdin.on("data", (chunk) => { input += chunk; });
+    process.stdin.on("end", () => {
+      const pkg = JSON.parse(input);
+      if (!pkg || typeof pkg !== "object" || Array.isArray(pkg) || typeof pkg.version !== "string" || pkg.version.trim() === "") {
+        throw new Error("package/package.json must contain a nonempty string version");
+      }
+      process.stdout.write(pkg.version.trim());
+    });
+  ')"; then
+    echo "error: npm publish tarball package/package.json is malformed or has no valid version: ${publish_target}" >&2
+    exit 2
+  fi
+  if [[ "${tarball_package_version}" != "${package_version}" ]]; then
+    echo "error: npm publish tarball version mismatch: expected ${package_version}, got ${tarball_package_version}" >&2
+    exit 2
+  fi
+fi
 
-const plan = resolveNpmPublishPlan(
-  process.env.PACKAGE_VERSION ?? "",
-  process.env.CURRENT_BETA_VERSION,
-);
-console.log(plan.channel);
-console.log(plan.publishTag);
-console.log(plan.mirrorDistTags.join(","));
-EOF
-)
+publish_plan="$(
+  PACKAGE_VERSION="${package_version}" REQUESTED_PUBLISH_TAG="${OPENCLAW_NPM_PUBLISH_TAG:-}" \
+    BYPASS_EXTENDED_STABLE_GUARD="${BYPASS_EXTENDED_STABLE_GUARD:-}" \
+    node scripts/openclaw-npm-extended-stable-release.mjs publish-plan
+)"
 
-release_channel="${publish_plan[0]}"
-publish_tag="${publish_plan[1]}"
-mirror_dist_tags_csv="${publish_plan[2]:-}"
-publish_cmd=(npm publish --access public --tag "${publish_tag}" --provenance)
+release_channel="${publish_plan%%$'\n'*}"
+publish_tag="${publish_plan#*$'\n'}"
+publish_cmd=(npm publish)
+if [[ -n "${publish_target}" ]]; then
+  publish_cmd+=("${publish_target}")
+fi
+publish_cmd+=(--access public --tag "${publish_tag}" --provenance)
 
 echo "Resolved package version: ${package_version}"
-echo "Current beta dist-tag: ${current_beta_version:-<missing>}"
 echo "Resolved release channel: ${release_channel}"
 echo "Resolved publish tag: ${publish_tag}"
-echo "Resolved mirror dist-tags: ${mirror_dist_tags_csv:-<none>}"
 echo "Publish auth: GitHub OIDC trusted publishing"
+if [[ -n "${publish_target}" ]]; then
+  echo "Resolved publish target: ${publish_target}"
+fi
 
 printf 'Publish command:'
 printf ' %q' "${publish_cmd[@]}"
 printf '\n'
 
 "${publish_cmd[@]}"
-
-if [[ -n "${mirror_dist_tags_csv}" ]]; then
-  IFS=',' read -r -a mirror_dist_tags <<< "${mirror_dist_tags_csv}"
-  for dist_tag in "${mirror_dist_tags[@]}"; do
-    [[ -n "${dist_tag}" ]] || continue
-    echo "Mirroring openclaw@${package_version} onto dist-tag ${dist_tag}"
-    npm dist-tag add "openclaw@${package_version}" "${dist_tag}"
-  done
-fi

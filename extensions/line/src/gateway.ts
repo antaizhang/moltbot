@@ -1,3 +1,8 @@
+// Line plugin module implements gateway behavior.
+import type { PluginRuntime } from "openclaw/plugin-sdk/channel-core";
+import { createAccountStatusSink } from "openclaw/plugin-sdk/channel-outbound";
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
+import { resolveLineAccount } from "./accounts.js";
 import {
   clearAccountEntryFields,
   DEFAULT_ACCOUNT_ID,
@@ -5,12 +10,19 @@ import {
   type LineConfig,
   type OpenClawConfig,
   type ResolvedLineAccount,
-} from "../api.js";
+} from "./channel-api.js";
 import { getLineRuntime } from "./runtime.js";
+
+const loadLineProbeRuntime = createLazyRuntimeModule(() => import("./probe.runtime.js"));
+const loadLineMonitorRuntime = createLazyRuntimeModule(() => import("./monitor.runtime.js"));
 
 export const lineGatewayAdapter: NonNullable<ChannelPlugin<ResolvedLineAccount>["gateway"]> = {
   startAccount: async (ctx) => {
     const account = ctx.account;
+    const statusSink = createAccountStatusSink({
+      accountId: account.accountId,
+      setStatus: ctx.setStatus,
+    });
     const token = account.channelAccessToken.trim();
     const secret = account.channelSecret.trim();
     if (!token) {
@@ -23,10 +35,11 @@ export const lineGatewayAdapter: NonNullable<ChannelPlugin<ResolvedLineAccount>[
         `LINE webhook mode requires a non-empty channel secret for account "${account.accountId}".`,
       );
     }
+    statusSink({ lifecycle: "starting" });
 
     let lineBotLabel = "";
     try {
-      const probe = await getLineRuntime().channel.line.probeLineBot(token, 2500);
+      const probe = await (await loadLineProbeRuntime()).probeLineBot(token, 2500);
       const displayName = probe.ok ? probe.bot?.displayName?.trim() : null;
       if (displayName) {
         lineBotLabel = ` (${displayName})`;
@@ -39,14 +52,21 @@ export const lineGatewayAdapter: NonNullable<ChannelPlugin<ResolvedLineAccount>[
 
     ctx.log?.info(`[${account.accountId}] starting LINE provider${lineBotLabel}`);
 
-    return await getLineRuntime().channel.line.monitorLineProvider({
+    const monitorLineProvider =
+      getLineRuntime().channel.line?.monitorLineProvider ??
+      (await loadLineMonitorRuntime()).monitorLineProvider;
+
+    return await monitorLineProvider({
       channelAccessToken: token,
       channelSecret: secret,
       accountId: account.accountId,
       config: ctx.cfg,
       runtime: ctx.runtime,
+      buildContext: (ctx.channelRuntime as PluginRuntime["channel"] | undefined)?.inbound
+        .buildContext,
       abortSignal: ctx.abortSignal,
       webhookPath: account.config.webhookPath,
+      statusSink,
     });
   },
   logoutAccount: async ({ accountId, cfg }) => {
@@ -103,10 +123,13 @@ export const lineGatewayAdapter: NonNullable<ChannelPlugin<ResolvedLineAccount>[
           delete nextCfg.channels;
         }
       }
-      await getLineRuntime().config.writeConfigFile(nextCfg);
+      await getLineRuntime().config.replaceConfigFile({
+        nextConfig: nextCfg,
+        afterWrite: { mode: "auto" },
+      });
     }
 
-    const resolved = getLineRuntime().channel.line.resolveLineAccount({
+    const resolved = resolveLineAccount({
       cfg: changed ? nextCfg : cfg,
       accountId,
     });

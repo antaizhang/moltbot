@@ -1,6 +1,7 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
+// Imessage tests cover conversation route plugin behavior.
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import {
-  __testing as sessionBindingTesting,
+  testing as sessionBindingTesting,
   registerSessionBindingAdapter,
 } from "openclaw/plugin-sdk/conversation-runtime";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -11,6 +12,7 @@ const baseCfg = {
   agents: {
     list: [{ id: "main" }, { id: "codex" }],
   },
+  bindings: [{ agentId: "main", match: { channel: "imessage", accountId: "default" } }],
 } satisfies OpenClawConfig;
 
 describe("resolveIMessageConversationRoute", () => {

@@ -1,10 +1,22 @@
+/**
+ * Browser profile capability resolution.
+ *
+ * Derives transport and driver capability flags used by routes and the Browser
+ * tool to choose CDP, Playwright, or Chrome MCP behavior.
+ */
 import type { ResolvedBrowserProfile } from "./config.js";
 
-export type BrowserProfileMode = "local-managed" | "local-existing-session" | "remote-cdp";
+type BrowserProfileMode =
+  | "local-managed"
+  | "local-existing-session"
+  | "local-extension"
+  | "remote-cdp";
 
-export type BrowserProfileCapabilities = {
+type BrowserProfileCapabilities = {
   mode: BrowserProfileMode;
   isRemote: boolean;
+  /** Browser process reads paths from the same filesystem as OpenClaw. */
+  browserFilesystemLocal: boolean;
   /** Profile uses the Chrome DevTools MCP server (existing-session driver). */
   usesChromeMcp: boolean;
   usesPersistentPlaywright: boolean;
@@ -14,6 +26,7 @@ export type BrowserProfileCapabilities = {
   supportsManagedTabLimit: boolean;
 };
 
+/** Return feature capabilities for a resolved browser profile. */
 export function getBrowserProfileCapabilities(
   profile: ResolvedBrowserProfile,
 ): BrowserProfileCapabilities {
@@ -21,8 +34,26 @@ export function getBrowserProfileCapabilities(
     return {
       mode: "local-existing-session",
       isRemote: false,
+      browserFilesystemLocal: false,
       usesChromeMcp: true,
       usesPersistentPlaywright: false,
+      supportsPerTabWs: false,
+      supportsJsonTabEndpoints: false,
+      supportsReset: false,
+      supportsManagedTabLimit: false,
+    };
+  }
+
+  // Extension relay profiles drive the user's signed-in browser through the
+  // paired Chrome extension. Ops run over persistent Playwright exactly like
+  // remote CDP, but the endpoint is the loopback relay server.
+  if (profile.driver === "extension") {
+    return {
+      mode: "local-extension",
+      isRemote: false,
+      browserFilesystemLocal: true,
+      usesChromeMcp: false,
+      usesPersistentPlaywright: true,
       supportsPerTabWs: false,
       supportsJsonTabEndpoints: false,
       supportsReset: false,
@@ -34,6 +65,7 @@ export function getBrowserProfileCapabilities(
     return {
       mode: "remote-cdp",
       isRemote: true,
+      browserFilesystemLocal: false,
       usesChromeMcp: false,
       usesPersistentPlaywright: true,
       supportsPerTabWs: false,
@@ -46,6 +78,9 @@ export function getBrowserProfileCapabilities(
   return {
     mode: "local-managed",
     isRemote: false,
+    // A loopback attach-only endpoint can terminate in Docker or a tunnel.
+    // Only an OpenClaw-owned browser is known to share this filesystem.
+    browserFilesystemLocal: !profile.attachOnly,
     usesChromeMcp: false,
     usesPersistentPlaywright: false,
     supportsPerTabWs: true,
@@ -55,6 +90,7 @@ export function getBrowserProfileCapabilities(
   };
 }
 
+/** Resolve the default snapshot format for a profile and available drivers. */
 export function resolveDefaultSnapshotFormat(params: {
   profile: ResolvedBrowserProfile;
   hasPlaywright: boolean;
@@ -76,6 +112,7 @@ export function resolveDefaultSnapshotFormat(params: {
   return params.hasPlaywright ? "ai" : "aria";
 }
 
+/** Return true when screenshots should use Playwright for the profile. */
 export function shouldUsePlaywrightForScreenshot(params: {
   profile: ResolvedBrowserProfile;
   wsUrl?: string;
@@ -85,6 +122,7 @@ export function shouldUsePlaywrightForScreenshot(params: {
   return !params.wsUrl || Boolean(params.ref) || Boolean(params.element);
 }
 
+/** Return true when ARIA snapshots should use Playwright for the profile. */
 export function shouldUsePlaywrightForAriaSnapshot(params: {
   profile: ResolvedBrowserProfile;
   wsUrl?: string;

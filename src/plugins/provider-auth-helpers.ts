@@ -1,28 +1,37 @@
+// Builds provider auth credentials from config and plugin metadata.
 import fs from "node:fs";
 import path from "node:path";
-import type { OAuthCredentials } from "@mariozechner/pi-ai";
-import { resolveOpenClawAgentDir } from "../agents/agent-paths.js";
+import { uniqueStrings } from "@openclaw/normalization-core/string-normalization";
+import { resolveDefaultAgentDir } from "../agents/agent-scope-config.js";
 import { buildAuthProfileId } from "../agents/auth-profiles/identity.js";
-import { upsertAuthProfile } from "../agents/auth-profiles/profiles.js";
-import { normalizeProviderIdForAuth } from "../agents/provider-id.js";
-import type { OpenClawConfig } from "../config/config.js";
+import {
+  upsertAuthProfile,
+  upsertAuthProfileWithLock,
+  upsertAuthProfileWithLockOrThrow,
+} from "../agents/auth-profiles/profiles.js";
+import { resolveProviderIdForAuth } from "../agents/provider-auth-aliases.js";
 import { resolveStateDir } from "../config/paths.js";
+import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   coerceSecretRef,
   DEFAULT_SECRET_PROVIDER_ALIAS,
+  parseEnvTemplateSecretRef,
   type SecretInput,
   type SecretRef,
 } from "../config/types.secrets.js";
+import { safeRealpathSync } from "../infra/boundary-path.js";
+import type { OAuthCredentials } from "../llm/oauth.js";
 import { getProviderEnvVars } from "../secrets/provider-env-vars.js";
+import { isValidSecretRef } from "../secrets/ref-contract.js";
 import { normalizeSecretInput } from "../utils/normalize-secret-input.js";
 import type { SecretInputMode } from "./provider-auth-types.js";
 
-const ENV_REF_PATTERN = /^\$\{([A-Z][A-Z0-9_]*)\}$/;
-
-const resolveAuthAgentDir = (agentDir?: string) => agentDir ?? resolveOpenClawAgentDir();
+const resolveAuthAgentDir = (agentDir?: string, config?: OpenClawConfig) =>
+  agentDir ?? resolveDefaultAgentDir(config ?? {});
 
 export type ApiKeyStorageOptions = {
   secretInputMode?: SecretInputMode;
+  config?: OpenClawConfig;
 };
 
 export type WriteOAuthCredentialsOptions = {
@@ -35,16 +44,11 @@ function buildEnvSecretRef(id: string): SecretRef {
   return { source: "env", provider: DEFAULT_SECRET_PROVIDER_ALIAS, id };
 }
 
-function parseEnvSecretRef(value: string): SecretRef | null {
-  const match = ENV_REF_PATTERN.exec(value);
-  if (!match) {
-    return null;
-  }
-  return buildEnvSecretRef(match[1]);
-}
-
-function resolveProviderDefaultEnvSecretRef(provider: string): SecretRef {
-  const envVars = getProviderEnvVars(provider);
+function resolveProviderDefaultEnvSecretRef(provider: string, config?: OpenClawConfig): SecretRef {
+  const envVars = getProviderEnvVars(provider, {
+    ...(config ? { config } : {}),
+    includeUntrustedWorkspacePlugins: false,
+  });
   const envVar = envVars?.find((candidate) => candidate.trim().length > 0);
   if (!envVar) {
     throw new Error(
@@ -59,17 +63,30 @@ function resolveApiKeySecretInput(
   input: SecretInput,
   options?: ApiKeyStorageOptions,
 ): SecretInput {
+  if (input !== null && typeof input === "object") {
+    const coercedRef = coerceSecretRef(input);
+    if (!coercedRef || !isValidSecretRef(coercedRef)) {
+      throw new Error("API key SecretRef is invalid.");
+    }
+    return coercedRef;
+  }
+  if (options?.secretInputMode === "plaintext") {
+    return normalizeSecretInput(input);
+  }
   const coercedRef = coerceSecretRef(input);
   if (coercedRef) {
+    if (!isValidSecretRef(coercedRef)) {
+      throw new Error("API key SecretRef is invalid.");
+    }
     return coercedRef;
   }
   const normalized = normalizeSecretInput(input);
-  const inlineEnvRef = parseEnvSecretRef(normalized);
+  const inlineEnvRef = parseEnvTemplateSecretRef(normalized, DEFAULT_SECRET_PROVIDER_ALIAS);
   if (inlineEnvRef) {
     return inlineEnvRef;
   }
   if (options?.secretInputMode === "ref") {
-    return resolveProviderDefaultEnvSecretRef(provider);
+    return resolveProviderDefaultEnvSecretRef(provider, options.config);
   }
   return normalized;
 }
@@ -103,18 +120,40 @@ export function buildApiKeyCredential(
   };
 }
 
+export function upsertApiKeyProfile(params: {
+  provider: string;
+  input: SecretInput;
+  agentDir?: string;
+  options?: ApiKeyStorageOptions;
+  profileId?: string;
+  metadata?: Record<string, string>;
+}): string {
+  const profileId = params.profileId ?? buildAuthProfileId({ providerId: params.provider });
+  upsertAuthProfile({
+    profileId,
+    credential: buildApiKeyCredential(
+      params.provider,
+      params.input,
+      params.metadata,
+      params.options,
+    ),
+    agentDir: resolveAuthAgentDir(params.agentDir, params.options?.config),
+  });
+  return profileId;
+}
+
 export function applyAuthProfileConfig(
   cfg: OpenClawConfig,
   params: {
     profileId: string;
     provider: string;
-    mode: "api_key" | "oauth" | "token";
+    mode: "api_key" | "aws-sdk" | "oauth" | "token";
     email?: string;
     displayName?: string;
     preferProfileFirst?: boolean;
   },
 ): OpenClawConfig {
-  const normalizedProvider = normalizeProviderIdForAuth(params.provider);
+  const normalizedProvider = resolveProviderIdForAuth(params.provider, { config: cfg });
   const profiles = {
     ...cfg.auth?.profiles,
     [params.profileId]: {
@@ -126,17 +165,20 @@ export function applyAuthProfileConfig(
   };
 
   const configuredProviderProfiles = Object.entries(cfg.auth?.profiles ?? {})
-    .filter(([, profile]) => normalizeProviderIdForAuth(profile.provider) === normalizedProvider)
+    .filter(
+      ([, profile]) =>
+        resolveProviderIdForAuth(profile.provider, { config: cfg }) === normalizedProvider,
+    )
     .map(([profileId, profile]) => ({ profileId, mode: profile.mode }));
 
   // Maintain `auth.order` when it already exists. Additionally, if we detect
   // mixed auth modes for the same provider, keep the newly selected profile first.
   const matchingProviderOrderEntries = Object.entries(cfg.auth?.order ?? {}).filter(
-    ([providerId]) => normalizeProviderIdForAuth(providerId) === normalizedProvider,
+    ([providerId]) => resolveProviderIdForAuth(providerId, { config: cfg }) === normalizedProvider,
   );
   const existingProviderOrder =
     matchingProviderOrderEntries.length > 0
-      ? [...new Set(matchingProviderOrderEntries.flatMap(([, order]) => order))]
+      ? uniqueStrings(matchingProviderOrderEntries.flatMap(([, order]) => order))
       : undefined;
   const preferProfileFirst = params.preferProfileFirst ?? true;
   const reorderedProviderOrder =
@@ -162,7 +204,8 @@ export function applyAuthProfileConfig(
     matchingProviderOrderEntries.length > 0
       ? Object.fromEntries(
           Object.entries(cfg.auth?.order ?? {}).filter(
-            ([providerId]) => normalizeProviderIdForAuth(providerId) !== normalizedProvider,
+            ([providerId]) =>
+              resolveProviderIdForAuth(providerId, { config: cfg }) !== normalizedProvider,
           ),
         )
       : cfg.auth?.order;
@@ -190,13 +233,49 @@ export function applyAuthProfileConfig(
   };
 }
 
-/** Resolve real path, returning null if the target doesn't exist. */
-function safeRealpathSync(dir: string): string | null {
-  try {
-    return fs.realpathSync(path.resolve(dir));
-  } catch {
-    return null;
+/** Returns true when config still names a removed auth profile. */
+export function configReferencesAuthProfile(cfg: OpenClawConfig, profileId: string): boolean {
+  return (
+    Boolean(cfg.auth?.profiles?.[profileId]) ||
+    Object.values(cfg.auth?.order ?? {}).some((order) => order.includes(profileId))
+  );
+}
+
+/**
+ * Counterpart to {@link applyAuthProfileConfig}: drops a profile from
+ * `auth.profiles` and every `auth.order` list. An emptied provider order is
+ * deleted rather than left as `[]`, because an authored empty order is a hard
+ * "select no profiles" instruction and would disable the provider entirely.
+ */
+export function removeAuthProfileConfig(cfg: OpenClawConfig, profileId: string): OpenClawConfig {
+  if (!configReferencesAuthProfile(cfg, profileId)) {
+    return cfg;
   }
+  const profiles = Object.fromEntries(
+    Object.entries(cfg.auth?.profiles ?? {}).filter(([id]) => id !== profileId),
+  );
+  const order = Object.entries(cfg.auth?.order ?? {}).reduce<Record<string, string[]>>(
+    (acc, [providerId, providerOrder]) => {
+      const next = providerOrder.filter((id) => id !== profileId);
+      // Drop only an order this removal emptied. An order that was already
+      // empty is an authored "select no profiles" instruction for an unrelated
+      // provider and must survive untouched.
+      if (next.length > 0 || next.length === providerOrder.length) {
+        acc[providerId] = next;
+      }
+      return acc;
+    },
+    {},
+  );
+  const { order: _droppedOrder, ...auth } = cfg.auth ?? {};
+  return {
+    ...cfg,
+    auth: {
+      ...auth,
+      profiles,
+      ...(Object.keys(order).length > 0 ? { order } : {}),
+    },
+  };
 }
 
 function resolveSiblingAgentDirs(primaryAgentDir: string): string[] {
@@ -224,7 +303,7 @@ function resolveSiblingAgentDirs(primaryAgentDir: string): string[] {
   const seen = new Set<string>();
   const result: string[] = [];
   for (const dir of [normalized, ...discovered]) {
-    const real = safeRealpathSync(dir);
+    const real = safeRealpathSync(path.resolve(dir));
     if (real && !seen.has(real)) {
       seen.add(real);
       result.push(real);
@@ -257,21 +336,21 @@ export async function writeOAuthCredentials(
     ...(options?.displayName ? { displayName: options.displayName } : {}),
   };
 
-  upsertAuthProfile({
+  await upsertAuthProfileWithLockOrThrow({
     profileId,
     credential,
     agentDir: resolvedAgentDir,
   });
 
   if (options?.syncSiblingAgents) {
-    const primaryReal = safeRealpathSync(resolvedAgentDir);
+    const primaryReal = safeRealpathSync(path.resolve(resolvedAgentDir));
     for (const targetAgentDir of targetAgentDirs) {
-      const targetReal = safeRealpathSync(targetAgentDir);
+      const targetReal = safeRealpathSync(path.resolve(targetAgentDir));
       if (targetReal && primaryReal && targetReal === primaryReal) {
         continue;
       }
       try {
-        upsertAuthProfile({
+        await upsertAuthProfileWithLock({
           profileId,
           credential,
           agentDir: targetAgentDir,

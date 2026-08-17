@@ -1,9 +1,29 @@
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+// Slack plugin module implements message action dispatch behavior.
+import { normalizeAccountId } from "openclaw/plugin-sdk/account-resolution";
+import type { AgentToolResult } from "openclaw/plugin-sdk/agent-core";
+import { readBooleanParam } from "openclaw/plugin-sdk/boolean-param";
+import { resolveReactionMessageId } from "openclaw/plugin-sdk/channel-actions";
 import type { ChannelMessageActionContext } from "openclaw/plugin-sdk/channel-contract";
-import { normalizeInteractiveReply } from "openclaw/plugin-sdk/interactive-runtime";
-import { readNumberParam, readStringParam } from "openclaw/plugin-sdk/param-readers";
-import { parseSlackBlocksInput } from "./blocks-input.js";
-import { buildSlackInteractiveBlocks } from "./blocks-render.js";
+import {
+  normalizeLegacyInteractiveReply,
+  normalizeMessagePresentation,
+} from "openclaw/plugin-sdk/interactive-runtime";
+import { readPositiveIntegerParam, readStringParam } from "openclaw/plugin-sdk/param-readers";
+import {
+  normalizeOptionalLowercaseString,
+  normalizeOptionalString,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { resolveDefaultSlackAccountId } from "./accounts.js";
+import { SLACK_MAX_BLOCKS } from "./blocks-input.js";
+import { buildSlackPresentationBlocks, canRenderSlackPresentation } from "./blocks-render.js";
+import { SLACK_EDIT_TEXT_MAX_BYTES } from "./limits.js";
+import { renderSlackMessagePresentationFallbackText } from "./presentation-fallback.js";
+import {
+  resolveSlackReplyBlockResolution,
+  resolveSlackReplyDeliveryMessages,
+  type SlackReplyDeliveryMessage,
+} from "./reply-blocks.js";
+import { countSlackTextUtf8Bytes } from "./truncate.js";
 
 type SlackActionInvoke = (
   action: Record<string, unknown>,
@@ -11,8 +31,42 @@ type SlackActionInvoke = (
   toolContext?: ChannelMessageActionContext["toolContext"],
 ) => Promise<AgentToolResult<unknown>>;
 
-function readSlackBlocksParam(actionParams: Record<string, unknown>) {
-  return parseSlackBlocksInput(actionParams.blocks) as Record<string, unknown>[] | undefined;
+function readSlackForceDocument(params: Record<string, unknown>): boolean {
+  return (
+    readBooleanParam(params, "forceDocument") ?? readBooleanParam(params, "asDocument") ?? false
+  );
+}
+
+function resolveSlackPresentationText(
+  content: string | undefined,
+  presentation: ReturnType<typeof normalizeMessagePresentation>,
+): string {
+  const hasStructuredData = presentation?.blocks.some(
+    (block) => block.type === "chart" || block.type === "table",
+  );
+  return hasStructuredData
+    ? renderSlackMessagePresentationFallbackText({ text: content, presentation })
+    : (content ?? "");
+}
+
+function renderSlackActionPresentation(
+  presentation: ReturnType<typeof normalizeMessagePresentation>,
+): {
+  blocks?: ReturnType<typeof buildSlackPresentationBlocks>;
+  usesPresentationTextFallback: boolean;
+} {
+  if (!presentation) {
+    return { usesPresentationTextFallback: false };
+  }
+  const renderedBlocks = canRenderSlackPresentation(presentation)
+    ? buildSlackPresentationBlocks(presentation)
+    : undefined;
+  const usesPresentationTextFallback = !renderedBlocks || renderedBlocks.length > SLACK_MAX_BLOCKS;
+  const blocks = usesPresentationTextFallback ? undefined : renderedBlocks;
+  return {
+    ...(blocks?.length ? { blocks } : {}),
+    usesPresentationTextFallback,
+  };
 }
 
 /** Translate generic channel action requests into Slack-specific tool invocations and payload shapes. */
@@ -40,36 +94,71 @@ export async function handleSlackMessageAction(params: {
       allowEmpty: true,
     });
     const mediaUrl = readStringParam(actionParams, "media", { trim: false });
-    const interactive = normalizeInteractiveReply(actionParams.interactive);
-    const interactiveBlocks = interactive ? buildSlackInteractiveBlocks(interactive) : undefined;
-    const blocks = readSlackBlocksParam(actionParams) ?? interactiveBlocks;
-    if (!content && !mediaUrl && !blocks) {
+    const presentation = normalizeMessagePresentation(actionParams.presentation);
+    const interactive = normalizeLegacyInteractiveReply(actionParams.interactive);
+    const hasStructuredContent = Boolean(presentation || interactive?.blocks.length);
+    const resolution = resolveSlackReplyBlockResolution(
+      {
+        text: content,
+        presentation,
+        interactive,
+      },
+      { materializeAuthoredText: hasStructuredContent },
+    );
+    const preparedMessages =
+      resolution.segments.length > 0
+        ? resolveSlackReplyDeliveryMessages({
+            authoredTextPlacement: resolution.authoredTextPlacement,
+            segments: resolution.segments,
+            text: content,
+          })
+        : [];
+    if (!content && preparedMessages.length === 0 && !mediaUrl) {
       throw new Error("Slack send requires message, blocks, or media.");
     }
-    if (mediaUrl && blocks) {
-      throw new Error("Slack send does not support blocks with media.");
+    const replyBroadcast = readBooleanParam(actionParams, "replyBroadcast");
+    if (replyBroadcast && mediaUrl) {
+      throw new Error("Slack replyBroadcast is only supported for text or block thread replies.");
     }
     const threadId = readStringParam(actionParams, "threadId");
     const replyTo = readStringParam(actionParams, "replyTo");
+    const topLevel =
+      readBooleanParam(actionParams, "topLevel") === true || actionParams.threadId === null;
+    const toolContext =
+      preparedMessages.length > 0
+        ? {
+            ...ctx.toolContext,
+            preparedMessages: preparedMessages satisfies readonly SlackReplyDeliveryMessage[],
+          }
+        : ctx.toolContext;
     return await invoke(
       {
         action: "sendMessage",
         to,
         content: content ?? "",
         mediaUrl: mediaUrl ?? undefined,
+        ...(readSlackForceDocument(actionParams) ? { forceDocument: true } : {}),
         accountId,
         threadTs: threadId ?? replyTo ?? undefined,
-        ...(blocks ? { blocks } : {}),
+        ...(topLevel ? { topLevel: true } : {}),
+        ...(replyBroadcast ? { replyBroadcast } : {}),
       },
       cfg,
-      ctx.toolContext,
+      toolContext,
     );
   }
 
   if (action === "react") {
-    const messageId = readStringParam(actionParams, "messageId", {
-      required: true,
+    const messageIdRaw = resolveReactionMessageId({
+      args: actionParams,
+      toolContext: ctx.toolContext,
     });
+    if (messageIdRaw == null) {
+      throw new Error(
+        "messageId required. Provide messageId explicitly or react to the current inbound message.",
+      );
+    }
+    const messageId = String(messageIdRaw);
     const emoji = readStringParam(actionParams, "emoji", { allowEmpty: true });
     const remove = typeof actionParams.remove === "boolean" ? actionParams.remove : undefined;
     return await invoke(
@@ -82,6 +171,7 @@ export async function handleSlackMessageAction(params: {
         accountId,
       },
       cfg,
+      ctx.toolContext,
     );
   }
 
@@ -89,33 +179,33 @@ export async function handleSlackMessageAction(params: {
     const messageId = readStringParam(actionParams, "messageId", {
       required: true,
     });
-    const limit = readNumberParam(actionParams, "limit", { integer: true });
     return await invoke(
       {
         action: "reactions",
         channelId: resolveChannelId(),
         messageId,
-        limit,
+        limit: actionParams.limit,
         accountId,
       },
       cfg,
+      ctx.toolContext,
     );
   }
 
   if (action === "read") {
-    const limit = readNumberParam(actionParams, "limit", { integer: true });
     const readAction: Record<string, unknown> = {
       action: "readMessages",
       channelId: resolveChannelId(),
-      limit,
+      limit: actionParams.limit,
       before: readStringParam(actionParams, "before"),
       after: readStringParam(actionParams, "after"),
+      messageId: readStringParam(actionParams, "messageId"),
       accountId,
     };
     if (includeReadThreadId) {
       readAction.threadId = readStringParam(actionParams, "threadId");
     }
-    return await invoke(readAction, cfg);
+    return await invoke(readAction, cfg, ctx.toolContext);
   }
 
   if (action === "edit") {
@@ -123,8 +213,25 @@ export async function handleSlackMessageAction(params: {
       required: true,
     });
     const content = readStringParam(actionParams, "message", { allowEmpty: true });
-    const blocks = readSlackBlocksParam(actionParams);
-    if (!content && !blocks) {
+    const presentation = normalizeMessagePresentation(actionParams.presentation);
+    const renderedPresentation = renderSlackActionPresentation(presentation);
+    // Slack hides top-level text when blocks are present on updates. Keep an
+    // unrenderable presentation text-only so its complete fallback stays visible.
+    const blocks = renderedPresentation.usesPresentationTextFallback
+      ? undefined
+      : renderedPresentation.blocks;
+    const accessibleContent = renderedPresentation.usesPresentationTextFallback
+      ? renderSlackMessagePresentationFallbackText({ text: content, presentation })
+      : resolveSlackPresentationText(content, presentation);
+    if (
+      renderedPresentation.usesPresentationTextFallback &&
+      countSlackTextUtf8Bytes(accessibleContent) > SLACK_EDIT_TEXT_MAX_BYTES
+    ) {
+      throw new Error(
+        `Slack presentation fallback exceeds the ${String(SLACK_EDIT_TEXT_MAX_BYTES)}-byte edit limit. Send a new message instead.`,
+      );
+    }
+    if (!accessibleContent && !blocks) {
       throw new Error("Slack edit requires message or blocks.");
     }
     return await invoke(
@@ -132,11 +239,12 @@ export async function handleSlackMessageAction(params: {
         action: "editMessage",
         channelId: resolveChannelId(),
         messageId,
-        content: content ?? "",
+        content: accessibleContent,
         blocks,
         accountId,
       },
       cfg,
+      ctx.toolContext,
     );
   }
 
@@ -152,6 +260,7 @@ export async function handleSlackMessageAction(params: {
         accountId,
       },
       cfg,
+      ctx.toolContext,
     );
   }
 
@@ -168,20 +277,44 @@ export async function handleSlackMessageAction(params: {
         accountId,
       },
       cfg,
+      ctx.toolContext,
     );
   }
 
   if (action === "member-info") {
-    const userId = readStringParam(actionParams, "userId", { required: true });
-    return await invoke({ action: "memberInfo", userId, accountId }, cfg);
+    const requesterAccountId = ctx.requesterAccountId
+      ? normalizeAccountId(ctx.requesterAccountId)
+      : undefined;
+    const targetAccountId = normalizeAccountId(accountId ?? resolveDefaultSlackAccountId(cfg));
+    const requesterUserId =
+      normalizeOptionalLowercaseString(ctx.toolContext?.currentChannelProvider) === "slack" &&
+      requesterAccountId !== undefined &&
+      requesterAccountId === targetAccountId
+        ? normalizeOptionalString(ctx.requesterSenderId)
+        : undefined;
+    const userId = readStringParam(actionParams, "userId") ?? requesterUserId;
+    if (!userId) {
+      throw new Error("member-info requires a userId outside a current Slack conversation.");
+    }
+    return await invoke({ action: "memberInfo", userId, accountId }, cfg, ctx.toolContext);
   }
 
   if (action === "emoji-list") {
-    const limit = readNumberParam(actionParams, "limit", { integer: true });
-    return await invoke({ action: "emojiList", limit, accountId }, cfg);
+    const limit = readPositiveIntegerParam(actionParams, "limit", {
+      message: "limit must be a positive integer.",
+    });
+    return await invoke({ action: "emojiList", limit, accountId }, cfg, ctx.toolContext);
   }
 
   if (action === "download-file") {
+    const fileIdParam = readStringParam(actionParams, "fileId");
+    const messageIdParam =
+      readStringParam(actionParams, "messageId") ?? readStringParam(actionParams, "message_id");
+    if (!fileIdParam && messageIdParam) {
+      throw new Error(
+        "download-file requires fileId (the Slack file id, for example F0B0LTT8M36 from event.files[].id), not messageId. Did you mean to pass fileId? messageId is the Slack message timestamp and is used by react / reactions / edit / delete / pin / unpin actions, not download-file.",
+      );
+    }
     const fileId = readStringParam(actionParams, "fileId", { required: true });
     const channelId =
       readStringParam(actionParams, "channelId") ?? readStringParam(actionParams, "to");
@@ -196,10 +329,15 @@ export async function handleSlackMessageAction(params: {
         accountId,
       },
       cfg,
+      ctx.toolContext,
     );
   }
 
   if (action === "upload-file") {
+    const replyBroadcast = readBooleanParam(actionParams, "replyBroadcast");
+    if (replyBroadcast) {
+      throw new Error("Slack replyBroadcast is only supported for text or block thread replies.");
+    }
     const to = readStringParam(actionParams, "to") ?? resolveChannelId();
     const filePath =
       readStringParam(actionParams, "filePath", { trim: false }) ??
@@ -210,6 +348,8 @@ export async function handleSlackMessageAction(params: {
     }
     const threadId =
       readStringParam(actionParams, "threadId") ?? readStringParam(actionParams, "replyTo");
+    const topLevel =
+      readBooleanParam(actionParams, "topLevel") === true || actionParams.threadId === null;
     return await invoke(
       {
         action: "uploadFile",
@@ -218,10 +358,16 @@ export async function handleSlackMessageAction(params: {
         initialComment:
           readStringParam(actionParams, "initialComment", { allowEmpty: true }) ??
           readStringParam(actionParams, "message", { allowEmpty: true }) ??
+          // `media` is accepted as an alias for the file, so a send-shaped call
+          // arrives with its text in `caption`; without this alias that text is
+          // silently dropped instead of becoming the upload's first comment.
+          readStringParam(actionParams, "caption", { allowEmpty: true }) ??
           "",
         filename: readStringParam(actionParams, "filename"),
         title: readStringParam(actionParams, "title"),
         threadTs: threadId ?? undefined,
+        ...(readSlackForceDocument(actionParams) ? { forceDocument: true } : {}),
+        ...(topLevel ? { topLevel: true } : {}),
         accountId,
       },
       cfg,

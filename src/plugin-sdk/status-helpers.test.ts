@@ -1,5 +1,8 @@
+// Status helper tests cover plugin status normalization and user-facing summaries.
 import { describe, expect, it } from "vitest";
+import { evaluateChannelHealth } from "../gateway/channel-health-policy.js";
 import {
+  asString,
   createAsyncComputedAccountStatusAdapter,
   buildBaseAccountStatusSnapshot,
   buildBaseChannelStatusSummary,
@@ -11,7 +14,66 @@ import {
   collectStatusIssuesFromLastError,
   createDependentCredentialStatusIssueCollector,
   createDefaultChannelRuntimeState,
+  readAccountStatusSnapshot,
+  standardDmPolicyOpenIssue,
+  standardNotConfiguredIssue,
 } from "./status-helpers.js";
+
+describe("status issue composition", () => {
+  it("preserves the shipped asString compatibility semantics", () => {
+    expect(asString("  work  ")).toBe("work");
+    expect(asString("   ")).toBeUndefined();
+    expect(asString(42)).toBeUndefined();
+  });
+
+  it("coerces only standard and requested account fields", () => {
+    expect(
+      readAccountStatusSnapshot(
+        { accountId: "work", enabled: true, configured: true, mode: "polling", secret: "drop" },
+        ["mode"],
+      ),
+    ).toEqual({
+      accountId: "work",
+      enabled: true,
+      configured: true,
+      running: undefined,
+      connected: undefined,
+      mode: "polling",
+    });
+    expect(readAccountStatusSnapshot(null, ["mode"])).toBeNull();
+  });
+
+  it("builds standard open-policy and missing-auth issues", () => {
+    expect(
+      standardDmPolicyOpenIssue({
+        channel: "zalo",
+        accountId: "default",
+        channelLabel: "Zalo",
+        configPath: "channels.zalo",
+      }),
+    ).toEqual({
+      channel: "zalo",
+      accountId: "default",
+      kind: "config",
+      message: 'Zalo dmPolicy is "open", allowing any user to message the bot without pairing.',
+      fix: 'Set channels.zalo.dmPolicy to "pairing" or "allowlist" to restrict access.',
+    });
+    expect(
+      standardNotConfiguredIssue({
+        channel: "zalouser",
+        accountId: "default",
+        message: "Not authenticated.",
+        fix: "Run login.",
+      }),
+    ).toEqual({
+      channel: "zalouser",
+      accountId: "default",
+      kind: "auth",
+      message: "Not authenticated.",
+      fix: "Run login.",
+    });
+  });
+});
 
 const defaultRuntimeState = {
   running: false,
@@ -162,27 +224,32 @@ describe("createDefaultChannelRuntimeState", () => {
 });
 
 describe("buildBaseChannelStatusSummary", () => {
-  it("defaults missing values", () => {
-    expect(buildBaseChannelStatusSummary({})).toEqual(defaultChannelSummary);
-  });
-
-  it("keeps explicit values", () => {
-    expect(
-      buildBaseChannelStatusSummary({
+  it.each([
+    {
+      name: "defaults missing values",
+      input: {},
+      expected: defaultChannelSummary,
+    },
+    {
+      name: "keeps explicit values",
+      input: {
         configured: true,
         running: true,
         lastStartAt: 1,
         lastStopAt: 2,
         lastError: "boom",
-      }),
-    ).toEqual({
-      ...defaultChannelSummary,
-      configured: true,
-      running: true,
-      lastStartAt: 1,
-      lastStopAt: 2,
-      lastError: "boom",
-    });
+      },
+      expected: {
+        ...defaultChannelSummary,
+        configured: true,
+        running: true,
+        lastStartAt: 1,
+        lastStopAt: 2,
+        lastError: "boom",
+      },
+    },
+  ])("$name", ({ input, expected }) => {
+    expect(buildBaseChannelStatusSummary(input)).toEqual(expected);
   });
 
   it("merges extra fields into the normalized channel summary", () => {
@@ -206,30 +273,32 @@ describe("buildBaseChannelStatusSummary", () => {
 });
 
 describe("buildBaseAccountStatusSnapshot", () => {
-  it("builds account status with runtime defaults", () => {
-    expect(
-      buildBaseAccountStatusSnapshot({
+  it.each([
+    {
+      name: "builds account status with runtime defaults",
+      input: {
         account: { accountId: "default", enabled: true, configured: true },
-      }),
-    ).toEqual(expectedAccountSnapshot({ enabled: true, configured: true }));
-  });
-
-  it("merges extra snapshot fields after the shared account shape", () => {
-    expect(
-      buildBaseAccountStatusSnapshot(
-        {
-          account: { accountId: "default", configured: true },
-        },
-        {
-          connected: true,
-          mode: "polling",
-        },
-      ),
-    ).toEqual({
-      ...expectedAccountSnapshot({ configured: true }),
-      connected: true,
-      mode: "polling",
-    });
+      },
+      extra: undefined,
+      expected: expectedAccountSnapshot({ enabled: true, configured: true }),
+    },
+    {
+      name: "merges extra snapshot fields after the shared account shape",
+      input: {
+        account: { accountId: "default", configured: true },
+      },
+      extra: {
+        connected: true,
+        mode: "polling",
+      },
+      expected: {
+        ...expectedAccountSnapshot({ configured: true }),
+        connected: true,
+        mode: "polling",
+      },
+    },
+  ])("$name", ({ input, extra, expected }) => {
+    expect(buildBaseAccountStatusSnapshot(input, extra)).toEqual(expected);
   });
 });
 
@@ -241,7 +310,12 @@ describe("buildComputedAccountStatusSnapshot", () => {
         enabled: true,
         configured: false,
       }),
-    ).toEqual(expectedAccountSnapshot({ enabled: true }));
+    ).toEqual(
+      expectedAccountSnapshot({
+        enabled: true,
+        stateReason: "not configured",
+      }),
+    );
   });
 
   it("merges computed extras after the shared fields", () => {
@@ -288,6 +362,28 @@ describe("computed account status adapters", () => {
       ).resolves.toEqual(expectedAdapterAccountSnapshot());
     },
   );
+
+  it("preserves ingress failure for channel health evaluation", async () => {
+    const status = createComputedStatusAdapter();
+    const snapshot = await status.buildAccountSnapshot!({
+      account: adapterAccount,
+      cfg: {} as never,
+      runtime: {
+        ...adapterRuntime,
+        ingressUnavailable: true,
+      },
+      probe: adapterProbe,
+    });
+
+    expect(
+      evaluateChannelHealth(snapshot, {
+        channelId: "discord",
+        now: 100_000,
+        channelConnectGraceMs: 10_000,
+        staleEventThresholdMs: 30_000,
+      }),
+    ).toEqual({ healthy: false, reason: "ingress-unavailable" });
+  });
 });
 
 describe("buildRuntimeAccountStatusSnapshot", () => {
@@ -311,8 +407,74 @@ describe("buildRuntimeAccountStatusSnapshot", () => {
         port: 3978,
       },
     },
+    {
+      name: "preserves runtime connectivity metadata",
+      input: {
+        runtime: {
+          connected: true,
+          restartPending: true,
+          reconnectAttempts: 3,
+          lastConnectedAt: 11,
+          lastDisconnect: { at: 12, error: "boom" },
+          lastEventAt: 13,
+          lastTransportActivityAt: 14,
+          healthState: "reconnecting",
+          lifecycle: "recovering" as const,
+          ingressUnavailable: true as const,
+          busy: true,
+          activeRuns: 2,
+          lastRunActivityAt: 15,
+          activeRunStartedAt: 16,
+          running: true,
+        },
+      },
+      extra: undefined,
+      expected: {
+        ...defaultRuntimeState,
+        running: true,
+        connected: true,
+        restartPending: true,
+        reconnectAttempts: 3,
+        lastConnectedAt: 11,
+        lastDisconnect: { at: 12, error: "boom" },
+        lastEventAt: 13,
+        lastTransportActivityAt: 14,
+        healthState: "reconnecting",
+        lifecycle: "recovering",
+        ingressUnavailable: true,
+        busy: true,
+        activeRuns: 2,
+        lastRunActivityAt: 15,
+        activeRunStartedAt: 16,
+        probe: undefined,
+      },
+    },
+    {
+      name: "projects terminalDisconnect when set",
+      input: {
+        runtime: {
+          running: false,
+          lifecycle: "blocked" as const,
+          terminalDisconnect: true,
+        },
+      },
+      extra: undefined,
+      expected: {
+        ...defaultRuntimeState,
+        running: false,
+        lifecycle: "blocked",
+        terminalDisconnect: true,
+        probe: undefined,
+      },
+    },
   ])("$name", ({ input, extra, expected }) => {
     expect(buildRuntimeAccountStatusSnapshot(input, extra)).toEqual(expected);
+  });
+
+  it("omits ingress availability when no failure was recorded", () => {
+    expect(buildRuntimeAccountStatusSnapshot({ runtime: { running: true } })).not.toHaveProperty(
+      "ingressUnavailable",
+    );
   });
 });
 
